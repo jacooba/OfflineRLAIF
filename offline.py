@@ -33,20 +33,23 @@ def render_frame_to_base64(frame):
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 class sfbc:
-    def __init__(self, subtrajectory_size=50, vlm_confidence_threshold=0.6, 
-                 use_vlm_weights=True, subsample=30, env_name="Pendulum-v1"):
-        self.subtrajectory_size = subtrajectory_size
+    def __init__(self, subtrajectory_len=100, vlm_confidence_threshold=0.6, 
+                 use_vlm_weights=True, subsample=25, env_name="Pendulum-v1"):
+        self.subtrajectory_len = subtrajectory_len
         self.vlm_confidence_threshold = vlm_confidence_threshold
         self.use_vlm_weights = use_vlm_weights
         self.bc_agent = None
         self.subsample = subsample
+        self.env_name = env_name
         self.vlm_prompt = "The goal is to balance the pendulum so it spends as much time vertical as possible. Is the task accomplished well? Answer only 'Y' for yes or 'N' for no, with the single letter capitalized with no punctuation."
 
     def fit(self, dataset, **kwargs):
         # Filter the dataset, if not already done
         filtered_dataset = self.filter_dataset(dataset)
+        # Make agent
+        self.bc_agent = d3rlpy.algos.BCConfig().create(device="mps")
         # Build the model with dataset
-        self.bc_agent = d3rlpy.algos.BC.from_dataset(filtered_dataset)
+        self.bc_agent.build_with_dataset(filtered_dataset)
         # Fit the model
         self.bc_agent.fit(filtered_dataset, **kwargs)
 
@@ -63,8 +66,10 @@ class sfbc:
             MDPDataset: Filtered dataset with high-confidence sub-trajectories.
         """
         # Compute hash of dataset (using observations & actions)
-        dataset_hash = hashlib.md5(np.concatenate([dataset.observations, dataset.actions]).tobytes()).hexdigest()
-        save_path = f"{dataset_hash}_sfbc.h5"
+        dataset_hash = hashlib.md5(np.stack(dataset.episodes).tobytes()).hexdigest()
+        algo_hash = hashlib.md5(f"{self.subtrajectory_len}_{self.subsample}_{self.vlm_confidence_threshold}".encode()).hexdigest()
+        combined_hash = hashlib.md5(f"{dataset_hash}_{algo_hash}".encode()).hexdigest()
+        save_path = f"{combined_hash}_sfbc.h5"
 
         # Check if the dataset already exists
         if os.path.exists(save_path):
@@ -79,18 +84,17 @@ class sfbc:
             episode_observations, episode_actions, episode_rewards = [], [], []
             episode_terminations, episode_truncations = [], []
 
-            for i in range(0, len(episode.observations) - self.subtraj_length, self.subtraj_length):
-                sub_obs = episode.observations[i:i+self.subtraj_length]
-                sub_act = episode.actions[i:i+self.subtraj_length]
+            for i in range(0, len(episode.observations) - self.subtrajectory_len, self.subtrajectory_len):
+                sub_obs = episode.observations[i:i+self.subtrajectory_len]
+                sub_act = episode.actions[i:i+self.subtrajectory_len]
 
                 # Subsample subtrajectory
-                sub_obs = sub_obs[::self.subsample]
-                sub_act = sub_act[::self.subsample]
+                short_sub_obs = sub_obs[::self.subsample]
 
                 # Convert numpy arrays to frames
                 render_env = gym.make(self.env_name, render_mode="rgb_array")
                 base64_frames = []
-                for state in sub_obs:
+                for state in short_sub_obs:
                     render_env.reset()
                     render_env.unwrapped.state = np.arctan2(state[1], state[0]), state[2]
                     base64_image = render_frame_to_base64(render_env.render())
@@ -99,7 +103,7 @@ class sfbc:
                 # Get VLM confidence score
                 vlm_conf = self.query_vlm(base64_frames)
 
-                if vlm_conf >= self.vlm_threshold:
+                if vlm_conf >= self.vlm_confidence_threshold:
                     episode_observations.extend(sub_obs)
                     episode_actions.extend(sub_act)
                     episode_rewards.extend(np.zeros(len(sub_obs)))  # Placeholder rewards
@@ -133,65 +137,65 @@ class sfbc:
     def build_with_dataset(self, dataset):
         return # Do later after filtering
 
-def query_vlm(self, subtrajectory, tries=3):
-    """Queries OpenAI VLM for confidence score on a subtrajectory."""
-    if tries == 0:
-        return 1.0  # Fallback confidence if VLM fails
-    
-    # Construct the message with images
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": self.vlm_prompt}  # Task description
-            ] + [{"type": "image_url", "image_url": f"data:image/jpeg;base64,{img}"} for img in subtrajectory]  # Attach images
-        }
-    ]
+    def query_vlm(self, subtrajectory, tries=3):
+        """Queries OpenAI VLM for confidence score on a subtrajectory."""
+        if tries == 0:
+            return 1.0  # Fallback confidence if VLM fails
+        
+        # Construct the message with images
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": self.vlm_prompt}  # Task description
+                ] + [{"type": "image_url", "image_url": f"data:image/jpeg;base64,{img}"} for img in subtrajectory]  # Attach images
+            }
+        ]
 
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4-vision-preview",
-            messages=messages,
-            max_tokens=1,  # We only want a Yes/No response
-            logprobs=True,  # Ensure we get log probabilities
-            temperature=0,  # Make it deterministic
-            top_logprobs=5  # Get logprobs for the top 5 tokens
-        )
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-4-vision-preview",
+                messages=messages,
+                max_tokens=1,  # We only want a Yes/No response
+                logprobs=True,  # Ensure we get log probabilities
+                temperature=0,  # Make it deterministic
+                top_logprobs=5  # Get logprobs for the top 5 tokens
+            )
 
-        # Extract log probabilities
-        logprobs = response["choices"][0]["logprobs"]["content"]
+            # Extract log probabilities
+            logprobs = response["choices"][0]["logprobs"]["content"]
 
-        # Define possible variations for "Yes" and "No"
-        yes_variants = {"y", "yes", "Y", "YES"}
-        no_variants = {"n", "no", "N", "NO"}
+            # Define possible variations for "Yes" and "No"
+            yes_variants = {"y", "yes", "Y", "YES"}
+            no_variants = {"n", "no", "N", "NO"}
 
-        yes_prob, no_prob = 0, 0
-        for token, logprob in zip(logprobs["tokens"], logprobs["token_logprobs"]):
-            normalized_token = token.strip().lower()
-            prob = math.exp(logprob)  # Convert log probability to probability
+            yes_prob, no_prob = 0, 0
+            for token, logprob in zip(logprobs["tokens"], logprobs["token_logprobs"]):
+                normalized_token = token.strip().lower()
+                prob = math.exp(logprob)  # Convert log probability to probability
 
-            if normalized_token in yes_variants:
-                yes_prob += prob
-            elif normalized_token in no_variants:
-                no_prob += prob
+                if normalized_token in yes_variants:
+                    yes_prob += prob
+                elif normalized_token in no_variants:
+                    no_prob += prob
 
-        # Debugging print statements
-        print(f"VLM Response Tokens: {logprobs['tokens']}")
-        print(f"YES Probability: {yes_prob}, NO Probability: {no_prob}")
+            # Debugging print statements
+            print(f"VLM Response Tokens: {logprobs['tokens']}")
+            print(f"YES Probability: {yes_prob}, NO Probability: {no_prob}")
 
-        # If "Yes" is missing, retry
-        if yes_prob == 0:
-            return self.query_vlm(subtrajectory, tries - 1)
+            # If "Yes" is missing, retry
+            if yes_prob == 0:
+                return self.query_vlm(subtrajectory, tries - 1)
 
-        # Ensure probability is valid
-        assert 0 <= yes_prob <= 1, "Invalid probability"
+            # Ensure probability is valid
+            assert 0 <= yes_prob <= 1, "Invalid probability"
 
-        return yes_prob  # Return confidence score
+            return yes_prob  # Return confidence score
 
-    except Exception as e:
-        print(f"VLM API Error: {e}")
-        return self.query_vlm(subtrajectory, tries - 1)  # Retry on failure
-    
+        except Exception as e:
+            print(f"VLM API Error: {e}")
+            return self.query_vlm(subtrajectory, tries - 1)  # Retry on failure
+        
 
 def train(seed, data_name="Pendulum_Stitched", algo="awac", vis_data=False, num_steps=500):
     assert data_name in ["Pendulum-v1", "Pendulum_Stitched", "antmaze-medium-play-v0"], "Invalid environment name"
