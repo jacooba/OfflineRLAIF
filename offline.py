@@ -44,9 +44,11 @@ class sfbc:
 
     def fit(self, dataset, **kwargs):
         # Filter the dataset, if not already done
-        self.filter_dataset(dataset)
+        filtered_dataset = self.filter_dataset(dataset)
+        # Build the model with dataset
+        self.bc_agent = d3rlpy.algos.BC.from_dataset(filtered_dataset)
         # Fit the model
-        self.bc_agent.fit(dataset, **kwargs)
+        self.bc_agent.fit(filtered_dataset, **kwargs)
 
     def predict(self, observation):
         # Predict the action
@@ -129,8 +131,7 @@ class sfbc:
         return filtered_dataset
 
     def build_with_dataset(self, dataset):
-        # Build the model with dataset
-        self.bc_agent = d3rlpy.algos.BC.from_dataset(dataset)
+        return # Do later after filtering
 
 def query_vlm(self, subtrajectory, tries=3):
     """Queries OpenAI VLM for confidence score on a subtrajectory."""
