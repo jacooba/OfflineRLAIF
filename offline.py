@@ -8,7 +8,6 @@ import imageio
 import base64
 import gym
 import random
-import math
 import torch
 import numpy as np
 import matplotlib
@@ -26,32 +25,45 @@ EXPERT_PATH = "Pendulum_Expert.d3"
 OPENAI_API_KEY = None
 
 def render_frame_to_base64(frame):
-    """Converts a rendered RGB frame (NumPy array) to base64."""
-    image = Image.fromarray(frame)  # Convert NumPy array to PIL image
-    buffer = BytesIO()
-    image.save(buffer, format="JPEG")  # Save as JPEG (efficient format)
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+    """Convert a rendered frame (numpy array) to a base64-encoded string."""
+    img = Image.fromarray(frame)
+    buffered = BytesIO()
+    img.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 class sfbc:
-    def __init__(self, subtrajectory_len=100, vlm_confidence_threshold=0.6, 
-                 use_vlm_weights=True, subsample=25, env_name="Pendulum-v1"):
+    def __init__(self, subtrajectory_len=100, vlm_confidence_threshold=0.85, visualize_data=True, 
+                 use_vlm_weights=True, subsample=25, env_name="Pendulum-v1", awac_instead=False):
         self.subtrajectory_len = subtrajectory_len
         self.vlm_confidence_threshold = vlm_confidence_threshold
         self.use_vlm_weights = use_vlm_weights
         self.bc_agent = None
         self.subsample = subsample
         self.env_name = env_name
-        self.vlm_prompt = "The goal is to balance the pendulum so it spends as much time vertical as possible. Is the task accomplished well? Answer only 'Y' for yes or 'N' for no, with the single letter capitalized with no punctuation."
+        self.awac_instead = awac_instead
+        self.visualize_data = visualize_data
+        self.vlm_prompt = "The goal is to swing the pendulum back and forth until vertical and then balance the pendulum so it spends as much time vertical as possible. Is the task accomplished well? Answer only 'Y' for yes or 'N' for no, with the single letter and no punctuation."
+        # For sparse feedback:
+        # self.vlm_prompt = "The goal is to balance the pendulum so it spends as much time vertical as possible. Is the task accomplished well? Answer only 'Y' for yes or 'N' for no, with the single letter and no punctuation."
+        self.client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
     def fit(self, dataset, **kwargs):
         # Filter the dataset, if not already done
-        filtered_dataset = self.filter_dataset(dataset)
+        filtered_dataset, _, unfiltered_dataset, _ = self.filter_dataset(dataset)
         # Make agent
-        self.bc_agent = d3rlpy.algos.BCConfig().create(device="mps")
+        if self.awac_instead: 
+            # Don't do BC on filtered data; do AWAC instead
+            self.agent = d3rlpy.algos.AWACConfig().create(device="mps")
+        else:
+            # Do BC on filtered data
+            self.bc_agent = d3rlpy.algos.BCConfig().create(device="mps")
         # Build the model with dataset
-        self.bc_agent.build_with_dataset(filtered_dataset)
+        self.agent.build_with_dataset(filtered_dataset)
         # Fit the model
-        self.bc_agent.fit(filtered_dataset, **kwargs)
+        if self.awac_instead:
+            self.agent.fit(unfiltered_dataset, **kwargs)
+        else:
+            self.bc_agent.fit(filtered_dataset, **kwargs)
 
     def predict(self, observation):
         # Predict the action
@@ -79,12 +91,23 @@ class sfbc:
         print(f"Filtering dataset and saving to {save_path}...")
 
         observations, actions, rewards, terminations, truncations = [], [], [], [], []
+        confidence_scores = []
+        unfiltered_confidence_scores = []
 
-        for episode in dataset.episodes:
+        num_episodes = len(dataset.episodes)
+        for n, episode in enumerate(dataset.episodes):
+            print(f"\nEpisode: {n+1}/{num_episodes}")
             episode_observations, episode_actions, episode_rewards = [], [], []
             episode_terminations, episode_truncations = [], []
+            episode_confidence_scores = []
+            unfiltered_episode_confidence_scores = []
 
-            for i in range(0, len(episode.observations) - self.subtrajectory_len, self.subtrajectory_len):
+            episode_frames = []
+
+            num_obs = len(episode.observations)
+            assert num_obs % self.subtrajectory_len == 0, "Subtrajectory length must divide episode length"
+            for i in range(0, len(episode.observations), self.subtrajectory_len):
+                print(f"  Observation: {i}-{i+self.subtrajectory_len}/{num_obs}")
                 sub_obs = episode.observations[i:i+self.subtrajectory_len]
                 sub_act = episode.actions[i:i+self.subtrajectory_len]
 
@@ -97,18 +120,42 @@ class sfbc:
                 for state in short_sub_obs:
                     render_env.reset()
                     render_env.unwrapped.state = np.arctan2(state[1], state[0]), state[2]
-                    base64_image = render_frame_to_base64(render_env.render())
+                    frame = render_env.render()
+                    base64_image = render_frame_to_base64(frame)
                     base64_frames.append(base64_image)
 
                 # Get VLM confidence score
                 vlm_conf = self.query_vlm(base64_frames)
+                unfiltered_episode_confidence_scores.append(np.ones(len(sub_obs))*vlm_conf)
 
+                # Filter subtrajectory based on VLM confidence
                 if vlm_conf >= self.vlm_confidence_threshold:
                     episode_observations.extend(sub_obs)
                     episode_actions.extend(sub_act)
-                    episode_rewards.extend(np.zeros(len(sub_obs)))  # Placeholder rewards
+                    episode_rewards.extend(np.ones(len(sub_obs))*vlm_conf)  # Fill with confidence score
                     episode_terminations.extend([False] * len(sub_obs))
                     episode_truncations.extend([False] * len(sub_obs))
+                    episode_confidence_scores.append(np.ones(len(sub_obs))*vlm_conf)
+
+                # Create videos for visualization
+                if self.visualize_data:
+                    overlay = np.zeros_like(frame, dtype=np.uint8) # green or red overlay
+                    if vlm_conf >= self.vlm_confidence_threshold:
+                        overlay[:, :, 1] = 200  # Green tint
+                    else:
+                        overlay[:, :, 0] = 200  # Red tint
+                    for obs in sub_obs:
+                        render_env.reset()
+                        render_env.unwrapped.state = np.arctan2(obs[1], obs[0]), obs[2]
+                        frame = render_env.render()
+                        blended_frame = (0.85 * frame + 0.15 * overlay).astype(np.uint8)
+                        episode_frames.append(blended_frame)
+
+            if self.visualize_data:
+                # Create directory if it doesn't exist
+                os.makedirs("sfbc_videos", exist_ok=True)
+                # Save video
+                imageio.mimsave(f"sfbc_videos/sfbc_ep{n+1}.mp4", episode_frames, fps=30)
 
             if episode_observations:
                 episode_truncations[-1] = True  # Mark last step as truncated
@@ -117,6 +164,8 @@ class sfbc:
                 rewards.append(episode_rewards)
                 terminations.append(episode_terminations)
                 truncations.append(episode_truncations)
+                confidence_scores.append(episode_confidence_scores)
+            unfiltered_confidence_scores.append(unfiltered_episode_confidence_scores)
 
         # Convert lists to NumPy arrays
         observations = np.vstack(observations)
@@ -132,7 +181,15 @@ class sfbc:
         filtered_dataset.dump(save_path)
         print(f"Filtered dataset saved at {save_path}")
 
-        return filtered_dataset
+        # Save an unfiltered version, where rewards are confidence scores
+        unfiltered_path = f"{combined_hash}_unfiltered_sfbc.h5"
+        unfiltered_dataset = MDPDataset(np.vstack(dataset.episodes.observations), np.vstack(dataset.episodes.actions), 
+                                        np.hstack(confidence_scores), np.hstack(dataset.episodes.terminations), 
+                                        np.hstack(dataset.episodes.truncations))
+        unfiltered_dataset.dump(unfiltered_path)
+        print(f"Unfiltered dataset saved at {unfiltered_path}")
+
+        return filtered_dataset, confidence_scores, unfiltered_dataset, unfiltered_confidence_scores
 
     def build_with_dataset(self, dataset):
         return # Do later after filtering
@@ -142,59 +199,73 @@ class sfbc:
         if tries == 0:
             return 1.0  # Fallback confidence if VLM fails
         
-        # Construct the message with images
+        # Construct messages with system prompt + images
         messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": self.vlm_prompt}  # Task description
-                ] + [{"type": "image_url", "image_url": f"data:image/jpeg;base64,{img}"} for img in subtrajectory]  # Attach images
-            }
+            {"role": "system", "content": self.vlm_prompt},  # Set system prompt
+            {"role": "user", "content": []}  # User message starts empty
         ]
 
+        # Append each base64-encoded image to the user message correctly
+        for base64_image in subtrajectory:
+            messages[1]["content"].append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{base64_image}", "detail": "low"}  # Correct format
+            })
+
         try:
-            response = openai.ChatCompletion.create(
-                model="gpt-4-vision-preview",
+            # OpenAI API call using new client
+            response = self.client.chat.completions.create(
+                model="gpt-4o", # gpt-4o-mini (does not work well) or gpt-4o
                 messages=messages,
                 max_tokens=1,  # We only want a Yes/No response
                 logprobs=True,  # Ensure we get log probabilities
                 temperature=0,  # Make it deterministic
-                top_logprobs=5  # Get logprobs for the top 5 tokens
+                top_logprobs=5,  # Get logprobs for the top 5 tokens,
             )
-
-            # Extract log probabilities
-            logprobs = response["choices"][0]["logprobs"]["content"]
-
-            # Define possible variations for "Yes" and "No"
-            yes_variants = {"y", "yes", "Y", "YES"}
-            no_variants = {"n", "no", "N", "NO"}
-
-            yes_prob, no_prob = 0, 0
-            for token, logprob in zip(logprobs["tokens"], logprobs["token_logprobs"]):
-                normalized_token = token.strip().lower()
-                prob = math.exp(logprob)  # Convert log probability to probability
-
-                if normalized_token in yes_variants:
-                    yes_prob += prob
-                elif normalized_token in no_variants:
-                    no_prob += prob
-
-            # Debugging print statements
-            print(f"VLM Response Tokens: {logprobs['tokens']}")
-            print(f"YES Probability: {yes_prob}, NO Probability: {no_prob}")
-
-            # If "Yes" is missing, retry
-            if yes_prob == 0:
-                return self.query_vlm(subtrajectory, tries - 1)
-
-            # Ensure probability is valid
-            assert 0 <= yes_prob <= 1, "Invalid probability"
-
-            return yes_prob  # Return confidence score
 
         except Exception as e:
             print(f"VLM API Error: {e}")
-            return self.query_vlm(subtrajectory, tries - 1)  # Retry on failure
+            return self.query_vlm(subtrajectory, tries - 1)
+
+        # Extract the most likely token
+        choice = response.choices[0]
+        predicted_token = choice.message.content.strip().lower()
+        print(f"VLM Response: {predicted_token}")
+
+        # Extract logprobs from the response
+        yes_prob = 0.0
+        no_prob = 0.0
+
+        # Yes/No Variants
+        yes_variants = {"y", "yes",}
+        no_variants = {"n", "no",}
+
+        # Extract top log probabilities
+        if choice.logprobs:
+            for type, logprob_entry in choice.logprobs:
+                if type == "content":
+                    for token_entry in logprob_entry:
+                        token = token_entry.token.strip().lower()
+                        prob = np.exp(token_entry.logprob)  # Convert log-prob to prob
+                        if token in yes_variants:
+                            yes_prob += prob
+                        elif token in no_variants:
+                            no_prob += prob
+
+        print(f"VLM Response: {predicted_token}")
+        print(f"Aggregated YES Probability: {yes_prob}, Aggregated NO Probability: {no_prob}")
+
+        if yes_prob == 0.0 and no_prob == 0.0:  # If VLM didn't return useful information
+            print("VLM did not return a yes or no probability. Retrying...")
+            return self.query_vlm(subtrajectory, tries - 1)
+        
+        # Rewweight yes and no to sum to 1
+        yes_prob /= (yes_prob + no_prob)
+
+        print(f"Final YES Probability: {yes_prob}")
+
+        assert 0 <= yes_prob <= 1, "Invalid probability value"
+        return yes_prob
         
 
 def train(seed, data_name="Pendulum_Stitched", algo="awac", vis_data=False, num_steps=500):
