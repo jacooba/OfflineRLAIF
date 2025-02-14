@@ -1,23 +1,200 @@
 import d3rlpy
 import minari
 import os
+import sys
+import openai
+import hashlib
 import imageio
+import base64
 import gym
 import random
+import math
 import torch
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # Use non-interactive backend on Mac
+
 import matplotlib.pyplot as plt
+
 from d3rlpy.dataset import MDPDataset
 from d3rlpy.metrics import EnvironmentEvaluator
+from io import BytesIO
+from PIL import Image
 
 STITCHED_PATH = "Pendulum_Stitched.h5"
 EXPERT_PATH = "Pendulum_Expert.d3"
+OPENAI_API_KEY = None
+
+def render_frame_to_base64(frame):
+    """Converts a rendered RGB frame (NumPy array) to base64."""
+    image = Image.fromarray(frame)  # Convert NumPy array to PIL image
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG")  # Save as JPEG (efficient format)
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+class sfbc:
+    def __init__(self, subtrajectory_size=50, vlm_confidence_threshold=0.6, 
+                 use_vlm_weights=True, subsample=30, env_name="Pendulum-v1"):
+        self.subtrajectory_size = subtrajectory_size
+        self.vlm_confidence_threshold = vlm_confidence_threshold
+        self.use_vlm_weights = use_vlm_weights
+        self.bc_agent = None
+        self.subsample = subsample
+        self.vlm_prompt = "The goal is to balance the pendulum so it spends as much time vertical as possible. Is the task accomplished well? Answer only 'Y' for yes or 'N' for no, with the single letter capitalized with no punctuation."
+
+    def fit(self, dataset, **kwargs):
+        # Filter the dataset, if not already done
+        self.filter_dataset(dataset)
+        # Fit the model
+        self.bc_agent.fit(dataset, **kwargs)
+
+    def predict(self, observation):
+        # Predict the action
+        self.bc_agent.predict(observation)
+
+    def filter_dataset(self, dataset):
+        """
+        Filters dataset using VLM scores and constructs a new MDPDataset.
+        Saves the dataset to <hash>_sfbc.h5 and skips filtering if it exists.
+
+        Returns:
+            MDPDataset: Filtered dataset with high-confidence sub-trajectories.
+        """
+        # Compute hash of dataset (using observations & actions)
+        dataset_hash = hashlib.md5(np.concatenate([dataset.observations, dataset.actions]).tobytes()).hexdigest()
+        save_path = f"{dataset_hash}_sfbc.h5"
+
+        # Check if the dataset already exists
+        if os.path.exists(save_path):
+            print(f"Filtered dataset found: {save_path}, loading instead of re-filtering.")
+            return MDPDataset.load(save_path)
+
+        print(f"Filtering dataset and saving to {save_path}...")
+
+        observations, actions, rewards, terminations, truncations = [], [], [], [], []
+
+        for episode in dataset.episodes:
+            episode_observations, episode_actions, episode_rewards = [], [], []
+            episode_terminations, episode_truncations = [], []
+
+            for i in range(0, len(episode.observations) - self.subtraj_length, self.subtraj_length):
+                sub_obs = episode.observations[i:i+self.subtraj_length]
+                sub_act = episode.actions[i:i+self.subtraj_length]
+
+                # Subsample subtrajectory
+                sub_obs = sub_obs[::self.subsample]
+                sub_act = sub_act[::self.subsample]
+
+                # Convert numpy arrays to frames
+                render_env = gym.make(self.env_name, render_mode="rgb_array")
+                base64_frames = []
+                for state in sub_obs:
+                    render_env.reset()
+                    render_env.unwrapped.state = np.arctan2(state[1], state[0]), state[2]
+                    base64_image = render_frame_to_base64(render_env.render())
+                    base64_frames.append(base64_image)
+
+                # Get VLM confidence score
+                vlm_conf = self.query_vlm(base64_frames)
+
+                if vlm_conf >= self.vlm_threshold:
+                    episode_observations.extend(sub_obs)
+                    episode_actions.extend(sub_act)
+                    episode_rewards.extend(np.zeros(len(sub_obs)))  # Placeholder rewards
+                    episode_terminations.extend([False] * len(sub_obs))
+                    episode_truncations.extend([False] * len(sub_obs))
+
+            if episode_observations:
+                episode_truncations[-1] = True  # Mark last step as truncated
+                observations.append(episode_observations)
+                actions.append(episode_actions)
+                rewards.append(episode_rewards)
+                terminations.append(episode_terminations)
+                truncations.append(episode_truncations)
+
+        # Convert lists to NumPy arrays
+        observations = np.vstack(observations)
+        actions = np.vstack(actions)
+        rewards = np.hstack(rewards)
+        terminations = np.hstack(terminations)
+        truncations = np.hstack(truncations)
+
+        # Convert to d3rlpy dataset
+        filtered_dataset = MDPDataset(observations, actions, rewards, terminations, truncations)
+
+        # Save dataset
+        filtered_dataset.dump(save_path)
+        print(f"Filtered dataset saved at {save_path}")
+
+        return filtered_dataset
+
+    def build_with_dataset(self, dataset):
+        # Build the model with dataset
+        self.bc_agent = d3rlpy.algos.BC.from_dataset(dataset)
+
+def query_vlm(self, subtrajectory, tries=3):
+    """Queries OpenAI VLM for confidence score on a subtrajectory."""
+    if tries == 0:
+        return 1.0  # Fallback confidence if VLM fails
+    
+    # Construct the message with images
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": self.vlm_prompt}  # Task description
+            ] + [{"type": "image_url", "image_url": f"data:image/jpeg;base64,{img}"} for img in subtrajectory]  # Attach images
+        }
+    ]
+
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4-vision-preview",
+            messages=messages,
+            max_tokens=1,  # We only want a Yes/No response
+            logprobs=True,  # Ensure we get log probabilities
+            temperature=0,  # Make it deterministic
+            top_logprobs=5  # Get logprobs for the top 5 tokens
+        )
+
+        # Extract log probabilities
+        logprobs = response["choices"][0]["logprobs"]["content"]
+
+        # Define possible variations for "Yes" and "No"
+        yes_variants = {"y", "yes", "Y", "YES"}
+        no_variants = {"n", "no", "N", "NO"}
+
+        yes_prob, no_prob = 0, 0
+        for token, logprob in zip(logprobs["tokens"], logprobs["token_logprobs"]):
+            normalized_token = token.strip().lower()
+            prob = math.exp(logprob)  # Convert log probability to probability
+
+            if normalized_token in yes_variants:
+                yes_prob += prob
+            elif normalized_token in no_variants:
+                no_prob += prob
+
+        # Debugging print statements
+        print(f"VLM Response Tokens: {logprobs['tokens']}")
+        print(f"YES Probability: {yes_prob}, NO Probability: {no_prob}")
+
+        # If "Yes" is missing, retry
+        if yes_prob == 0:
+            return self.query_vlm(subtrajectory, tries - 1)
+
+        # Ensure probability is valid
+        assert 0 <= yes_prob <= 1, "Invalid probability"
+
+        return yes_prob  # Return confidence score
+
+    except Exception as e:
+        print(f"VLM API Error: {e}")
+        return self.query_vlm(subtrajectory, tries - 1)  # Retry on failure
+    
 
 def train(seed, data_name="Pendulum_Stitched", algo="awac", vis_data=False, num_steps=500):
     assert data_name in ["Pendulum-v1", "Pendulum_Stitched", "antmaze-medium-play-v0"], "Invalid environment name"
-    assert algo in ["awac", "bc", "td3+bc"], "Invalid agent name"
+    assert algo in ["awac", "bc", "td3+bc", "sfbc"], "Invalid agent name"
 
     set_seed(seed)
 
@@ -73,6 +250,8 @@ def train(seed, data_name="Pendulum_Stitched", algo="awac", vis_data=False, num_
         agent = d3rlpy.algos.BCConfig().create(device="mps")
     elif algo == "td3+bc":
         agent = d3rlpy.algos.TD3PlusBCConfig().create(device="mps")
+    elif algo == "sfbc":
+        agent = sfbc(env_name=env_name)
     print("model initialized:", agent)
 
     # Ensure the dataset is not empty
@@ -285,7 +464,10 @@ def move_d3rl_agent_to_device(agent, device):
 if __name__ == "__main__":
     seed = 20
     data_name="Pendulum_Stitched" # "Pendulum-v1", "Pendulum_Stitched"
-    algo="td3+bc"
+    algo="sfbc"
+
+    assert len(sys.argv) == 2, "Usage: python offline.py <openai_api_key or None>"
+    OPENAI_API_KEY = sys.argv[1]
 
     # If there is no "Pendulum_Stitched" dataset locally, create it
     if data_name == "Pendulum_Stitched" and not os.path.exists(STITCHED_PATH):
