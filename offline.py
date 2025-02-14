@@ -48,60 +48,53 @@ class sfbc:
         self.client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
     def fit(self, dataset, **kwargs):
-        # Filter the dataset, if not already done
-        filtered_dataset, _, unfiltered_dataset, _ = self.filter_dataset(dataset)
+        # Query VLM for confidence scores, if not already done
+        confidence_scores = self.get_confidence(dataset)
+        # Filter the dataset using VLM scores
+        filtered_dataset, unfiltered_dataset = self.filter_dataset(dataset, confidence_scores)
         # Make agent
         if self.awac_instead: 
             # Don't do BC on filtered data; do AWAC instead
             self.agent = d3rlpy.algos.AWACConfig().create(device="mps")
         else:
             # Do BC on filtered data
-            self.bc_agent = d3rlpy.algos.BCConfig().create(device="mps")
+            self.agent = d3rlpy.algos.BCConfig().create(device="mps")
         # Build the model with dataset
         self.agent.build_with_dataset(filtered_dataset)
         # Fit the model
         if self.awac_instead:
             self.agent.fit(unfiltered_dataset, **kwargs)
         else:
-            self.bc_agent.fit(filtered_dataset, **kwargs)
+            self.agent.fit(filtered_dataset, **kwargs)
 
     def predict(self, observation):
         # Predict the action
-        self.bc_agent.predict(observation)
+        self.agent.predict(observation)
 
-    def filter_dataset(self, dataset):
+    def get_confidence(self, dataset):
         """
-        Filters dataset using VLM scores and constructs a new MDPDataset.
-        Saves the dataset to <hash>_sfbc.h5 and skips filtering if it exists.
-
-        Returns:
-            MDPDataset: Filtered dataset with high-confidence sub-trajectories.
+        Queries VLM for confidence scores on dataset and returns the scores.
         """
         # Compute hash of dataset (using observations & actions)
         dataset_hash = hashlib.md5(np.stack(dataset.episodes).tobytes()).hexdigest()
-        algo_hash = hashlib.md5(f"{self.subtrajectory_len}_{self.subsample}_{self.vlm_confidence_threshold}".encode()).hexdigest()
+        algo_hash = hashlib.md5(f"{self.subtrajectory_len}_{self.subsample}".encode()).hexdigest()
         combined_hash = hashlib.md5(f"{dataset_hash}_{algo_hash}".encode()).hexdigest()
-        save_path = f"{combined_hash}_sfbc.h5"
+        # Save path for numpty array of confidence scores
+        save_path = f"{combined_hash}_vlm.npy"
 
-        # Check if the dataset already exists
+        # Check if the confidence scores already exist
         if os.path.exists(save_path):
-            print(f"Filtered dataset found: {save_path}, loading instead of re-filtering.")
-            return MDPDataset.load(save_path)
-
-        print(f"Filtering dataset and saving to {save_path}...")
-
-        observations, actions, rewards, terminations, truncations = [], [], [], [], []
+            print(f"VLM confidence scores found: {save_path}, loading instead of re-querying.")
+            return np.load(save_path)
+        
+        print(f"Querying VLM for confidence scores and saving to {save_path}...")
         confidence_scores = []
-        unfiltered_confidence_scores = []
 
         num_episodes = len(dataset.episodes)
         for n, episode in enumerate(dataset.episodes):
+        # for n, episode in enumerate(dataset.episodes[:10]): # For testing
             print(f"\nEpisode: {n+1}/{num_episodes}")
-            episode_observations, episode_actions, episode_rewards = [], [], []
-            episode_terminations, episode_truncations = [], []
             episode_confidence_scores = []
-            unfiltered_episode_confidence_scores = []
-
             episode_frames = []
 
             num_obs = len(episode.observations)
@@ -109,7 +102,6 @@ class sfbc:
             for i in range(0, len(episode.observations), self.subtrajectory_len):
                 print(f"  Observation: {i}-{i+self.subtrajectory_len}/{num_obs}")
                 sub_obs = episode.observations[i:i+self.subtrajectory_len]
-                sub_act = episode.actions[i:i+self.subtrajectory_len]
 
                 # Subsample subtrajectory
                 short_sub_obs = sub_obs[::self.subsample]
@@ -126,16 +118,8 @@ class sfbc:
 
                 # Get VLM confidence score
                 vlm_conf = self.query_vlm(base64_frames)
-                unfiltered_episode_confidence_scores.append(np.ones(len(sub_obs))*vlm_conf)
-
-                # Filter subtrajectory based on VLM confidence
-                if vlm_conf >= self.vlm_confidence_threshold:
-                    episode_observations.extend(sub_obs)
-                    episode_actions.extend(sub_act)
-                    episode_rewards.extend(np.ones(len(sub_obs))*vlm_conf)  # Fill with confidence score
-                    episode_terminations.extend([False] * len(sub_obs))
-                    episode_truncations.extend([False] * len(sub_obs))
-                    episode_confidence_scores.append(np.ones(len(sub_obs))*vlm_conf)
+                # vlm_conf = random.random()  # For testing
+                episode_confidence_scores.append(vlm_conf)
 
                 # Create videos for visualization
                 if self.visualize_data:
@@ -157,6 +141,62 @@ class sfbc:
                 # Save video
                 imageio.mimsave(f"sfbc_videos/sfbc_ep{n+1}.mp4", episode_frames, fps=30)
 
+            confidence_scores.append(episode_confidence_scores)
+
+        # Convert lists to NumPy arrays
+        confidence_scores = np.array(confidence_scores)
+
+        # Save confidence scores
+        np.save(save_path, confidence_scores)
+        print(f"VLM confidence scores saved at {save_path}")
+
+        return confidence_scores
+
+    def filter_dataset(self, dataset, confidence_scores):
+        """
+        Filters dataset using VLM saved scores and constructs a new MDPDataset.
+
+        Returns:
+            MDPDataset: Filtered dataset with high-confidence sub-trajectories.
+        """
+        print(f"Filtering dataset")
+
+        observations, actions, rewards, terminations, truncations = [], [], [], [], []
+        unfiltered_rewards, unfiltered_terminations, unfiltered_truncations = [], [], []
+
+        num_episodes = len(dataset.episodes)
+        for n, episode in enumerate(dataset.episodes):
+        # for n, episode in enumerate(dataset.episodes[:10]): # For testing
+            print(f"\nEpisode: {n+1}/{num_episodes}")
+            episode_observations, episode_actions, episode_rewards = [], [], []
+            episode_terminations, episode_truncations = [], []
+            unfiltered_episode_rewards, unfiltered_episode_terminations, unfiltered_episode_truncations = [], [], []
+
+            # Get VLM confidence score
+            episode_confidence_scores = confidence_scores[n]
+
+            num_obs = len(episode.observations)
+            assert num_obs % self.subtrajectory_len == 0, "Subtrajectory length must divide episode length"
+            for i in range(0, len(episode.observations), self.subtrajectory_len):
+                print(f"  Observation: {i}-{i+self.subtrajectory_len}/{num_obs}")
+                sub_obs = episode.observations[i:i+self.subtrajectory_len]
+                sub_act = episode.actions[i:i+self.subtrajectory_len]
+
+                # Get VLM confidence score
+                index = i // self.subtrajectory_len
+                vlm_conf = episode_confidence_scores[index]
+
+                # Filter subtrajectory based on VLM confidence
+                if vlm_conf >= self.vlm_confidence_threshold:
+                    episode_observations.extend(sub_obs)
+                    episode_actions.extend(sub_act)
+                    episode_rewards.extend(np.ones(len(sub_obs))*vlm_conf)  # Fill with confidence score
+                    episode_terminations.extend([False] * len(sub_obs))
+                    episode_truncations.extend([False] * len(sub_obs))
+                unfiltered_episode_rewards.extend(np.ones(len(sub_obs))*vlm_conf)
+                unfiltered_episode_terminations.extend([False] * len(sub_obs))
+                unfiltered_episode_truncations.extend([False] * len(sub_obs))
+
             if episode_observations:
                 episode_truncations[-1] = True  # Mark last step as truncated
                 observations.append(episode_observations)
@@ -164,8 +204,10 @@ class sfbc:
                 rewards.append(episode_rewards)
                 terminations.append(episode_terminations)
                 truncations.append(episode_truncations)
-                confidence_scores.append(episode_confidence_scores)
-            unfiltered_confidence_scores.append(unfiltered_episode_confidence_scores)
+            unfiltered_episode_truncations[-1] = True  # Mark last step as truncated
+            unfiltered_rewards.append(unfiltered_episode_rewards)
+            unfiltered_terminations.append(unfiltered_episode_terminations)
+            unfiltered_truncations.append(unfiltered_episode_truncations)
 
         # Convert lists to NumPy arrays
         observations = np.vstack(observations)
@@ -173,23 +215,18 @@ class sfbc:
         rewards = np.hstack(rewards)
         terminations = np.hstack(terminations)
         truncations = np.hstack(truncations)
+        unfiltered_rewards = np.hstack(unfiltered_rewards)
+        unfiltered_terminations = np.hstack(unfiltered_terminations)
+        unfiltered_truncations = np.hstack(unfiltered_truncations)
 
         # Convert to d3rlpy dataset
         filtered_dataset = MDPDataset(observations, actions, rewards, terminations, truncations)
 
-        # Save dataset
-        filtered_dataset.dump(save_path)
-        print(f"Filtered dataset saved at {save_path}")
+        # Create an unfiltered version, where rewards are confidence scores
+        unfiltered_dataset = MDPDataset(np.array([ep.observations for ep in dataset.episodes]), np.array([ep.actions for ep in dataset.episodes]), 
+                                        unfiltered_rewards, unfiltered_terminations, unfiltered_truncations)
 
-        # Save an unfiltered version, where rewards are confidence scores
-        unfiltered_path = f"{combined_hash}_unfiltered_sfbc.h5"
-        unfiltered_dataset = MDPDataset(np.vstack(dataset.episodes.observations), np.vstack(dataset.episodes.actions), 
-                                        np.hstack(confidence_scores), np.hstack(dataset.episodes.terminations), 
-                                        np.hstack(dataset.episodes.truncations))
-        unfiltered_dataset.dump(unfiltered_path)
-        print(f"Unfiltered dataset saved at {unfiltered_path}")
-
-        return filtered_dataset, confidence_scores, unfiltered_dataset, unfiltered_confidence_scores
+        return filtered_dataset, unfiltered_dataset
 
     def build_with_dataset(self, dataset):
         return # Do later after filtering
