@@ -1,3 +1,4 @@
 Results/
 sfbc_videos/
 *.npy
+*.jsonl

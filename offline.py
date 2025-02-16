@@ -13,6 +13,7 @@ import numpy as np
 import matplotlib
 import time
 import json
+import signal
 import multiprocessing
 matplotlib.use("Agg")  # Use non-interactive backend on Mac
 
@@ -48,8 +49,8 @@ def visualize_episode_feedback(args):
             blended_frame = (0.85 * frame + 0.15 * overlay).astype(np.uint8)
             frames.append(blended_frame)
     # Create dir if it doesn't exist
-    os.makedirs("vlm_feedback", exist_ok=True)
-    imageio.mimsave(f"vlm_feedback/episode_{ep_num}.mp4", frames, fps=30)
+    os.makedirs("sfbc_videos", exist_ok=True)
+    imageio.mimsave(f"sfbc_videos/episode_{ep_num}.mp4", frames, fps=30)
 
 def convert_episode_to_frames(args):
     episode, subtrajectory_len, subsample, env_name = args
@@ -101,10 +102,11 @@ class sfbc:
 
     def fit(self, dataset, **kwargs):
         # Query VLM for confidence scores, if not already done
-        # confidence_scores = self.get_confidence(dataset)
-        confidence_scores = self.get_confidence_batched(dataset)
-        if self.visualize_data:
-            self.visualize_data_batched(dataset, confidence_scores)
+        confidence_scores = self.get_confidence(dataset)
+        # Batched version, but has to be used with 4o-mini due to API limits:
+        # confidence_scores = self.get_confidence_batched(dataset)
+        # if self.visualize_data:
+        #     self.visualize_data_batched(dataset, confidence_scores)
         # Filter the dataset using VLM scores
         filtered_dataset, unfiltered_dataset = self.filter_dataset(dataset, confidence_scores)
         # Make agent
@@ -248,6 +250,8 @@ class sfbc:
 
         # Query VLM for confidence scores
         print(f"Querying VLM for confidence scores...")
+        # sub_trajectories_by_frames = sub_trajectories_by_frames[0:1] # For testing
+        assert len(sub_trajectories_by_frames) == 1, "Only one episode for testing"
         confidence_scores = self.query_vlm_batch(sub_trajectories_by_frames)
 
         # Reshape confidence scores to match dataset structure
@@ -447,7 +451,7 @@ class sfbc:
                     "method": "POST",
                     "url": "/v1/chat/completions",
                     "body": {
-                        "model": "gpt-4o",
+                        "model": "gpt-4o-mini", # 4o batch limits per day are too low
                         "messages": messages,
                         "max_tokens": 1,
                         "logprobs": True,
@@ -472,12 +476,29 @@ class sfbc:
         batch_response = self.client.batches.create(
             input_file_id=batch_file_id,
             endpoint="/v1/chat/completions",
-            completion_window="1h",
+            completion_window="24h",
             metadata={"description": "Batch VLM evaluation"}
         )
 
         batch_id = batch_response.id
         print(f"Batch submitted successfully! Batch ID: {batch_id}")
+
+        # **Define the signal handler inside this function**
+        def cancel_batch_and_exit(signum, frame):
+            print(f"\nReceived signal {signum}. Canceling batch {batch_id} before exiting...")
+            try:
+                response = self.client.batches.cancel(batch_id)
+                if response.status == "cancelling":
+                    print(f"Batch {batch_id} is being cancelled.")
+                else:
+                    print(f"Failed to cancel batch {batch_id}. Current status: {response.status}")
+            except Exception as e:
+                print(f"Error while cancelling batch: {e}")
+            
+            sys.exit(1)  # Exit with error status
+        # Register signal handlers for program termination
+        signal.signal(signal.SIGINT, cancel_batch_and_exit)  # Handle Ctrl+C
+        signal.signal(signal.SIGTERM, cancel_batch_and_exit) # Handle termination signal
 
         # **Step 4: Wait for the Batch Job to Complete**
         print(f"Waiting for batch {batch_id} to complete...")
@@ -500,7 +521,7 @@ class sfbc:
 
         confidences = []
         for result in results:
-            choice = result["choices"][0]
+            choice = result['response']['body']['choices'][0]
             predicted_token = choice["message"]["content"].strip().lower()
             yes_prob = 0.0
             no_prob = 0.0
@@ -508,15 +529,13 @@ class sfbc:
             yes_variants = {"y", "yes"}
             no_variants = {"n", "no"}
 
-            for type, logprob_entry in choice.logprobs:
-                if type == "content":
-                    for token_entry in logprob_entry:
-                        token = token_entry.token.strip().lower()
-                        prob = np.exp(token_entry.logprob)  # Convert log-prob to prob
-                        if token in yes_variants:
-                            yes_prob += prob
-                        elif token in no_variants:
-                            no_prob += prob
+            for token_entry in choice["logprobs"]["content"]:
+                token = token_entry["token"].strip().lower()
+                prob = np.exp(token_entry["logprob"])  # Convert log-prob to prob
+                if token in yes_variants:
+                    yes_prob += prob
+                elif token in no_variants:
+                    no_prob += prob
 
             if yes_prob == 0.0 and no_prob == 0.0:
                 yes_prob = 0.0  # Default to assuming negative if uncertain
