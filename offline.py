@@ -76,7 +76,7 @@ class sfbc:
         Queries VLM for confidence scores on dataset and returns the scores.
         """
         # Compute hash of dataset (using observations & actions)
-        dataset_hash = hashlib.md5(np.stack(dataset.episodes).tobytes()).hexdigest()
+        dataset_hash = hashlib.md5(np.stack(dataset.episodes[0].observations).tobytes()).hexdigest()
         algo_hash = hashlib.md5(f"{self.subtrajectory_len}_{self.subsample}".encode()).hexdigest()
         combined_hash = hashlib.md5(f"{dataset_hash}_{algo_hash}".encode()).hexdigest()
         # Save path for numpty array of confidence scores
