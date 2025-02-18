@@ -28,57 +28,7 @@ from PIL import Image
 # from weighted_bc import RewardWeightedBC
 
 STITCHED_PATH = "Pendulum_Stitched.h5"
-EXPERT_PATH = "Pendulum_Expert.d3"
 OPENAI_API_KEY = None
-
-def visualize_episode_feedback(args):
-    """Visualize an episode with feedback overlay."""
-    ep_num, episode, feedback, env_name, vlm_confidence_threshold = args
-    render_env = gym.make(env_name, render_mode="rgb_array")
-    frames = []
-    num_confs = len(feedback)
-    len_subtrajectory = len(episode.observations) // num_confs
-    for i, vlm_conf in enumerate(feedback):
-        sub_trajectory = episode.observations[i:i+len_subtrajectory]
-        overlay = np.zeros_like(frame, dtype=np.uint8) # green or red overlay
-        if vlm_conf >= vlm_confidence_threshold:
-            overlay[:, :, 1] = 200  # Green tint
-        else:
-            overlay[:, :, 0] = 200  # Red tint
-        for obs in sub_trajectory:
-            render_env.reset()
-            render_env.unwrapped.state = np.arctan2(obs[1], obs[0]), obs[2]
-            frame = render_env.render()
-            blended_frame = (0.85 * frame + 0.15 * overlay).astype(np.uint8)
-            frames.append(blended_frame)
-    # Create dir if it doesn't exist
-    os.makedirs("sfbc_videos", exist_ok=True)
-    imageio.mimsave(f"sfbc_videos/episode_{ep_num}.mp4", frames, fps=30)
-
-def convert_episode_to_frames(args):
-    episode, subtrajectory_len, subsample, env_name = args
-    num_obs = len(episode.observations)
-    assert num_obs % subtrajectory_len == 0, "Subtrajectory length must divide episode length"
-    base64_frames = []
-    for i in range(0, len(episode.observations), subtrajectory_len):
-        print(f"  Observation: {i}-{i+subtrajectory_len}/{num_obs}")
-        sub_obs = episode.observations[i:i+subtrajectory_len]
-
-        # Subsample subtrajectory
-        short_sub_obs = sub_obs[::subsample]
-
-        # Convert numpy arrays to frames
-        render_env = gym.make(env_name, render_mode="rgb_array")
-        sub_frames = []
-        for state in short_sub_obs:
-            render_env.reset()
-            render_env.unwrapped.state = np.arctan2(state[1], state[0]), state[2]
-            frame = render_env.render()
-            base64_image = render_frame_to_base64(frame)
-            sub_frames.append(base64_image)
-        base64_frames.append(sub_frames)
-
-    return base64_frames
 
 def render_frame_to_base64(frame):
     """Convert a rendered frame (numpy array) to a base64-encoded string."""
@@ -98,20 +48,13 @@ class sfbc:
         self.env_name = env_name
         self.awac_instead = awac_instead
         self.visualize_data = visualize_data
-        # self.vlm_prompt = "You are watching a video of a red stick. <Goal> Tell me whether the black dot is at the bottom of the stick in at least one frame. Then also tell me whether the stick has moved between sides of the screen (left to right or right to left). <Goal> <Format> Tell me the answer to each question. After, you will need to sumarize. If the answer to either is yes, then also say 'Y'. If the answer to both is no, then say 'N'. For example: 'The black dot is not at the bottom of the stick. The stick has moved left to right once. Therefore one of these is true: Y' <Format>"
         self.vlm_prompts = ["You are watching a video of a red stick. If the black dot is at the bottom of the stick, answer 'Y'. Otherwise, answer 'N'.",
                             "You are watching a video of a red stick. If the stick has moved between sides of the screen (left to right or right to left), answer 'Y'. Otherwise, answer 'N'."]
-        # For sparse feedback:
-        # self.vlm_prompt = "The goal is to balance the pendulum so it spends as much time vertical as possible. Is the task accomplished well? Answer only 'Y' for yes or 'N' for no, with the single letter and no punctuation."
         self.client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
     def fit(self, dataset, **kwargs):
         # Query VLM for confidence scores, if not already done
         confidence_scores = self.get_confidence(dataset)
-        # Batched version, but has to be used with 4o-mini due to API limits:
-        # confidence_scores = self.get_confidence_batched(dataset)
-        # if self.visualize_data:
-        #     self.visualize_data_batched(dataset, confidence_scores)
         # Filter the dataset using VLM scores
         filtered_dataset, unfiltered_dataset = self.filter_dataset(dataset, confidence_scores)
         # Make agent
@@ -183,8 +126,7 @@ class sfbc:
                     base64_image = render_frame_to_base64(frame)
                     base64_frames.append(base64_image)
 
-                # Get VLM confidence score
-                # vlm_conf = self.query_vlm(base64_frames)
+                # Get VLM confidence scores
                 vlm_conf = 0.0
                 for vlm_prompt in self.vlm_prompts:
                     print(f"  Querying VLM with prompt: {vlm_prompt}")
@@ -215,63 +157,6 @@ class sfbc:
                 imageio.mimsave(f"sfbc_videos/sfbc_ep{n+1}.mp4", episode_frames, fps=30)
 
             confidence_scores.append(episode_confidence_scores)
-
-        # Convert lists to NumPy arrays
-        confidence_scores = np.array(confidence_scores)
-
-        # Save confidence scores
-        np.save(save_path, confidence_scores)
-        print(f"VLM confidence scores saved at {save_path}")
-
-        return confidence_scores
-    
-    def visualize_data_batched(self, dataset, confidence_scores):
-        print(f"Visualizing data with VLM feedback...")
-        pool = multiprocessing.Pool()
-        args = [(n, ep, confidence_scores[n], self.env_name, self.vlm_confidence_threshold) 
-                for n, ep in enumerate(dataset.episodes)]
-        pool.map(visualize_episode_feedback, args)
-
-    def get_confidence_batched(self, dataset):
-        """
-        Queries VLM for confidence scores on dataset and returns the scores.
-        """
-        # Compute hash of dataset (using observations & actions)
-        dataset_hash = hashlib.md5(np.stack(dataset.episodes[0].observations).tobytes()).hexdigest()
-        algo_hash = hashlib.md5(f"{self.subtrajectory_len}_{self.subsample}".encode()).hexdigest()
-        combined_hash = hashlib.md5(f"{dataset_hash}_{algo_hash}".encode()).hexdigest()
-        # Save path for numpty array of confidence scores
-        save_path = f"{combined_hash}_vlm.npy"
-
-        # Check if the confidence scores already exist
-        if os.path.exists(save_path):
-            print(f"VLM confidence scores found: {save_path}, loading instead of re-querying.")
-            return np.load(save_path)
-        
-        if self.visualize_data:
-            print(f"Warning: Batched confidenc query will not visualize data.")
-
-        # Convert dataset to subtrajectories of frames
-        print(f"Converting episodes to frames")
-        num_episodes = len(dataset.episodes)
-
-        # Convert in parallel
-        pool = multiprocessing.Pool()
-        args = [(ep, self.subtrajectory_len, self.subsample, self.env_name) for ep in dataset.episodes]
-        sub_trajectories_by_episode = pool.map(convert_episode_to_frames, args)
-        pool.close()
-
-        # Flatten list of lists
-        sub_trajectories_by_frames = [frames for episode in sub_trajectories_by_episode for frames in episode]
-
-        # Query VLM for confidence scores
-        print(f"Querying VLM for confidence scores...")
-        # sub_trajectories_by_frames = sub_trajectories_by_frames[0:1] # For testing
-        assert len(sub_trajectories_by_frames) == 1, "Only one episode for testing"
-        confidence_scores = self.query_vlm_batch(sub_trajectories_by_frames)
-
-        # Reshape confidence scores to match dataset structure
-        confidence_scores = np.array(confidence_scores).reshape(num_episodes, -1)
 
         # Convert lists to NumPy arrays
         confidence_scores = np.array(confidence_scores)
@@ -384,7 +269,7 @@ class sfbc:
             response = self.client.chat.completions.create(
                 model="gpt-4o", # gpt-4o-mini (does not work well) or gpt-4o
                 messages=messages,
-                max_tokens=60,  # We only want a Yes/No response # For testing
+                max_tokens=1,  # We only want a Yes/No response
                 logprobs=True,  # Ensure we get log probabilities
                 temperature=0,  # Make it deterministic
                 top_logprobs=5,  # Get logprobs for the top 5 tokens,
@@ -413,8 +298,6 @@ class sfbc:
                 if type == "content":
                     for token_entry in logprob_entry:
                         token = token_entry.token.strip().lower()
-                        # _, token = token.split(":") # For testing
-                        # token = token.strip()
                         prob = np.exp(token_entry.logprob)  # Convert log-prob to prob
                         if token in yes_variants:
                             yes_prob += prob
@@ -423,151 +306,9 @@ class sfbc:
 
         print(f"  Aggregated YES Probability: {yes_prob}, Aggregated NO Probability: {no_prob}")
 
-        # For testing
-        # if yes_prob == 0.0 and no_prob == 0.0:  # If VLM didn't return useful information
-        #     print("  VLM did not return a yes or no probability. Retrying...")
-        #     return self.query_vlm(subtrajectory, tries - 1)
-        
-        # # Reweight yes and no to sum to 1
-        # yes_prob /= (yes_prob + no_prob)
+        assert 0 <= no_prob <= 1, "Invalid probability value"
+        return 1. - no_prob # No probability is more reliable
 
-        print(f"  Final YES Probability: {yes_prob}")
-
-        assert 0 <= yes_prob <= 1, "Invalid probability value"
-        return 1. - no_prob # yes_prob # for testing
-    
-    def query_vlm_batch(self, batched_subtrajectories):
-        """
-        Queries OpenAI VLM using batch API for multiple sub-trajectories at once.
-        1. Creates a JSONL batch file.
-        2. Submits the batch request.
-        3. Waits for completion.
-        4. Fetches results and extracts confidence scores.
-
-        Args:
-            batched_subtrajectories (list of list of str): 
-                Each sub-list is a subtrajectory, containing base64-encoded images.
-
-        Returns:
-            List of confidence scores (float) for each subtrajectory.
-        """
-
-        # **Step 1: Create the JSONL Batch File**
-        print(f"Creating batch file for {len(batched_subtrajectories)} sub-trajectories...")
-
-        batch_file_path = "vlm_batch_requests.jsonl"
-        with open(batch_file_path, "w") as f:
-            for i, subtrajectory in enumerate(batched_subtrajectories):
-                messages = [
-                    {"role": "system", "content": self.vlm_prompt},
-                    {"role": "user", "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}", "detail": "low"}} for img in subtrajectory
-                    ]}
-                ]
-                request = {
-                    "custom_id": f"request-{i+1}",
-                    "method": "POST",
-                    "url": "/v1/chat/completions",
-                    "body": {
-                        "model": "gpt-4o-mini", # 4o batch limits per day are too low
-                        "messages": messages,
-                        "max_tokens": 1,
-                        "logprobs": True,
-                        "temperature": 0,
-                        "top_logprobs": 5
-                    }
-                }
-                f.write(json.dumps(request) + "\n")
-
-        print(f"Batch file {batch_file_path} created successfully!")
-
-        # **Step 2: Upload the Batch File to OpenAI**
-        print("Uploading batch file to OpenAI...")
-        batch_input_file = self.client.files.create(
-            file=open(batch_file_path, "rb"),
-            purpose="batch"
-        )
-        batch_file_id = batch_input_file.id
-
-        # **Step 3: Submit the Batch Request**
-        print(f"Submitting batch job with file ID: {batch_file_id}...")
-        batch_response = self.client.batches.create(
-            input_file_id=batch_file_id,
-            endpoint="/v1/chat/completions",
-            completion_window="24h",
-            metadata={"description": "Batch VLM evaluation"}
-        )
-
-        batch_id = batch_response.id
-        print(f"Batch submitted successfully! Batch ID: {batch_id}")
-
-        # **Define the signal handler inside this function**
-        def cancel_batch_and_exit(signum, frame):
-            print(f"\nReceived signal {signum}. Canceling batch {batch_id} before exiting...")
-            try:
-                response = self.client.batches.cancel(batch_id)
-                if response.status == "cancelling":
-                    print(f"Batch {batch_id} is being cancelled.")
-                else:
-                    print(f"Failed to cancel batch {batch_id}. Current status: {response.status}")
-            except Exception as e:
-                print(f"Error while cancelling batch: {e}")
-            
-            sys.exit(1)  # Exit with error status
-        # Register signal handlers for program termination
-        signal.signal(signal.SIGINT, cancel_batch_and_exit)  # Handle Ctrl+C
-        signal.signal(signal.SIGTERM, cancel_batch_and_exit) # Handle termination signal
-
-        # **Step 4: Wait for the Batch Job to Complete**
-        print(f"Waiting for batch {batch_id} to complete...")
-        while True:
-            batch_status = self.client.batches.retrieve(batch_id)
-            if batch_status.status == "completed":
-                print(f"Batch {batch_id} completed successfully!")
-                output_file_id = batch_status.output_file_id
-                break
-            elif batch_status.status == "failed":
-                raise RuntimeError(f"Batch {batch_id} failed!")
-            elif batch_status.status in {"in_progress", "pending"}:
-                print("Batch still processing... waiting 1 second.")
-                time.sleep(1)
-
-        # **Step 5: Fetch Results**
-        print(f"Fetching batch results from file ID: {output_file_id}...")
-        file_response = self.client.files.content(output_file_id)
-        results = [json.loads(line) for line in file_response.text.split("\n") if line.strip()]
-
-        confidences = []
-        for result in results:
-            choice = result['response']['body']['choices'][0]
-            predicted_token = choice["message"]["content"].strip().lower()
-            yes_prob = 0.0
-            no_prob = 0.0
-
-            yes_variants = {"y", "yes"}
-            no_variants = {"n", "no"}
-
-            for token_entry in choice["logprobs"]["content"]:
-                token = token_entry["token"].strip().lower()
-                prob = np.exp(token_entry["logprob"])  # Convert log-prob to prob
-                if token in yes_variants:
-                    yes_prob += prob
-                elif token in no_variants:
-                    no_prob += prob
-
-            if yes_prob == 0.0 and no_prob == 0.0:
-                yes_prob = 0.0  # Default to assuming negative if uncertain
-            else:
-                yes_prob /= (yes_prob + no_prob)
-
-            confidences.append(yes_prob)
-
-            print(f"VLM Response: {predicted_token}")
-            print(f"Aggregated YES Probability: {yes_prob}, Aggregated NO Probability: {no_prob}")
-
-        print(f"Processed {len(confidences)} sub-trajectories!")
-        return confidences
-            
 
 def train(seed, data_name="Pendulum_Stitched", algo="awac", vis_data=False, num_steps=500):
     assert data_name in ["Pendulum-v1", "Pendulum_Stitched", "antmaze-medium-play-v0"], "Invalid environment name"
@@ -646,13 +387,6 @@ def train(seed, data_name="Pendulum_Stitched", algo="awac", vis_data=False, num_
     agent.build_with_dataset(mdp_dataset)
     history = agent.fit(mdp_dataset, n_steps=num_steps, n_steps_per_epoch=50, show_progress=True, 
         evaluators={'environment': env_evaluator}, logger_adapter=d3rlpy.logging.NoopAdapterFactory())
-    # Alternatively, Use `fitter()` for step-by-step training
-    # for epoch, metrics in enumerate(awac.fitter(mdp_dataset, n_steps=5000, show_progress=True, evaluators={'environment': env_evaluator})):
-    #     print(f"Epoch {epoch}: {metrics}")
-    #     # Optionally, break early if training starts logging NaNs
-    #     if np.isnan(metrics["loss"]):
-    #         print("NaN detected, stopping training early.")
-    #         break
     print("Done")
 
     return history, agent, env, env_name
@@ -733,7 +467,6 @@ def rollout(seed, agent, env_name, filename, n_episodes=1, fps=30, max_steps=100
     # Save video
     imageio.mimsave(filename, frames, fps=fps)
     print(f"Saved rollout video at {filename}")
-
 
 def set_seed(seed):
     """Set random seed globally for reproducibility."""
@@ -830,17 +563,6 @@ def visualize_data(env_name, mdp_dataset, data_name, episodes=[0, 250, 499]):
             render_env.unwrapped.state = np.arctan2(state[1], state[0]), state[2]
             frames.append(render_env.render())
         imageio.mimsave(f"{data_name}_episode{ep_index}.mp4", frames, fps=30)
-
-def move_d3rl_agent_to_device(agent, device):
-    """Move d3rlpy agent's internal model to a specified device (CPU/MPS/GPU)."""
-    if hasattr(agent, "impl") and agent.impl is not None:
-        for attr_name in dir(agent.impl._modules):
-            module = getattr(agent.impl._modules, attr_name)
-            if isinstance(module, torch.nn.Module):
-                module.to(device)
-        agent.impl._device = torch.device(device)
-    else:
-        raise RuntimeError("Agent implementation not initialized. Did you call `build_with_dataset()`?")
 
 
 if __name__ == "__main__":
