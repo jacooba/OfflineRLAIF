@@ -11,10 +11,6 @@ import random
 import torch
 import numpy as np
 import matplotlib
-import time
-import json
-import signal
-import multiprocessing
 matplotlib.use("Agg")  # Use non-interactive backend on Mac
 
 import matplotlib.pyplot as plt
@@ -24,8 +20,7 @@ from d3rlpy.metrics import EnvironmentEvaluator
 from io import BytesIO
 from PIL import Image
 
-# This is not working yet:
-# from weighted_bc import RewardWeightedBC
+from weighted_bc import WBCConfig
 
 STITCHED_PATH = "Pendulum_Stitched.h5"
 OPENAI_API_KEY = None
@@ -64,9 +59,7 @@ class sfbc:
         else:
             # Do BC on filtered data
             if self.use_vlm_weights:
-                # Not working yet:
-                assert False, "Weighted BC not implemented yet."
-                # self.agent = RewardWeightedBC()
+                self.agent = WBCConfig().create(device="mps")
             else:
                 self.agent = d3rlpy.algos.BCConfig().create(device="mps")
         # Build the model with dataset
@@ -258,7 +251,7 @@ class sfbc:
     def query_vlm(self, subtrajectory, vlm_prompt, tries=3):
         """Queries OpenAI VLM for confidence score on a subtrajectory."""
         if tries == 0:
-            return 1.0  # Fallback confidence if VLM fails
+            assert False, "VLM API Error: Max retries exceeded"
         
         # Construct messages with system prompt + images
         messages = [
