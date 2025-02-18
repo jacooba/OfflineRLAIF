@@ -88,8 +88,8 @@ def render_frame_to_base64(frame):
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 class sfbc:
-    def __init__(self, subtrajectory_len=100, vlm_confidence_threshold=0.85, visualize_data=True, 
-                 use_vlm_weights=True, subsample=25, env_name="Pendulum-v1", awac_instead=False):
+    def __init__(self, subtrajectory_len=100, vlm_confidence_threshold=0.05, visualize_data=True, 
+                 use_vlm_weights=False, subsample=20, env_name="Pendulum-v1", awac_instead=False):
         self.subtrajectory_len = subtrajectory_len
         self.vlm_confidence_threshold = vlm_confidence_threshold
         self.use_vlm_weights = use_vlm_weights
@@ -98,7 +98,9 @@ class sfbc:
         self.env_name = env_name
         self.awac_instead = awac_instead
         self.visualize_data = visualize_data
-        self.vlm_prompt = "The goal is to swing the pendulum back and forth until vertical and then balance the pendulum so it spends as much time vertical as possible. Is the task accomplished well? Answer only 'Y' for yes or 'N' for no, with the single letter and no punctuation."
+        # self.vlm_prompt = "You are watching a video of a red stick. <Goal> Tell me whether the black dot is at the bottom of the stick in at least one frame. Then also tell me whether the stick has moved between sides of the screen (left to right or right to left). <Goal> <Format> Tell me the answer to each question. After, you will need to sumarize. If the answer to either is yes, then also say 'Y'. If the answer to both is no, then say 'N'. For example: 'The black dot is not at the bottom of the stick. The stick has moved left to right once. Therefore one of these is true: Y' <Format>"
+        self.vlm_prompts = ["You are watching a video of a red stick. If the black dot is at the bottom of the stick, answer 'Y'. Otherwise, answer 'N'.",
+                            "You are watching a video of a red stick. If the stick has moved between sides of the screen (left to right or right to left), answer 'Y'. Otherwise, answer 'N'."]
         # For sparse feedback:
         # self.vlm_prompt = "The goal is to balance the pendulum so it spends as much time vertical as possible. Is the task accomplished well? Answer only 'Y' for yes or 'N' for no, with the single letter and no punctuation."
         self.client = openai.OpenAI(api_key=OPENAI_API_KEY)
@@ -182,7 +184,13 @@ class sfbc:
                     base64_frames.append(base64_image)
 
                 # Get VLM confidence score
-                vlm_conf = self.query_vlm(base64_frames)
+                # vlm_conf = self.query_vlm(base64_frames)
+                vlm_conf = 0.0
+                for vlm_prompt in self.vlm_prompts:
+                    print(f"  Querying VLM with prompt: {vlm_prompt}")
+                    vlm_conf += self.query_vlm(base64_frames, vlm_prompt)
+                vlm_conf = min(vlm_conf, 1.0)  # Clip to 1.0
+                print(f"  Combined VLM Confidence: {vlm_conf}\n")
                 # vlm_conf = random.random()  # For testing
                 episode_confidence_scores.append(vlm_conf)
 
@@ -353,14 +361,14 @@ class sfbc:
     def build_with_dataset(self, dataset):
         return # Do later after filtering
 
-    def query_vlm(self, subtrajectory, tries=3):
+    def query_vlm(self, subtrajectory, vlm_prompt, tries=3):
         """Queries OpenAI VLM for confidence score on a subtrajectory."""
         if tries == 0:
             return 1.0  # Fallback confidence if VLM fails
         
         # Construct messages with system prompt + images
         messages = [
-            {"role": "system", "content": self.vlm_prompt},  # Set system prompt
+            {"role": "system", "content": vlm_prompt},  # Set system prompt
             {"role": "user", "content": []}  # User message starts empty
         ]
 
@@ -376,20 +384,20 @@ class sfbc:
             response = self.client.chat.completions.create(
                 model="gpt-4o", # gpt-4o-mini (does not work well) or gpt-4o
                 messages=messages,
-                max_tokens=1,  # We only want a Yes/No response
+                max_tokens=60,  # We only want a Yes/No response # For testing
                 logprobs=True,  # Ensure we get log probabilities
                 temperature=0,  # Make it deterministic
                 top_logprobs=5,  # Get logprobs for the top 5 tokens,
             )
 
         except Exception as e:
-            print(f"VLM API Error: {e}")
+            print(f"  VLM API Error: {e}")
             return self.query_vlm(subtrajectory, tries - 1)
 
         # Extract the most likely token
         choice = response.choices[0]
         predicted_token = choice.message.content.strip().lower()
-        print(f"VLM Response: {predicted_token}")
+        print(f"  VLM Response: {predicted_token}")
 
         # Extract logprobs from the response
         yes_prob = 0.0
@@ -405,26 +413,28 @@ class sfbc:
                 if type == "content":
                     for token_entry in logprob_entry:
                         token = token_entry.token.strip().lower()
+                        # _, token = token.split(":") # For testing
+                        # token = token.strip()
                         prob = np.exp(token_entry.logprob)  # Convert log-prob to prob
                         if token in yes_variants:
                             yes_prob += prob
                         elif token in no_variants:
                             no_prob += prob
 
-        print(f"VLM Response: {predicted_token}")
-        print(f"Aggregated YES Probability: {yes_prob}, Aggregated NO Probability: {no_prob}")
+        print(f"  Aggregated YES Probability: {yes_prob}, Aggregated NO Probability: {no_prob}")
 
-        if yes_prob == 0.0 and no_prob == 0.0:  # If VLM didn't return useful information
-            print("VLM did not return a yes or no probability. Retrying...")
-            return self.query_vlm(subtrajectory, tries - 1)
+        # For testing
+        # if yes_prob == 0.0 and no_prob == 0.0:  # If VLM didn't return useful information
+        #     print("  VLM did not return a yes or no probability. Retrying...")
+        #     return self.query_vlm(subtrajectory, tries - 1)
         
-        # Rewweight yes and no to sum to 1
-        yes_prob /= (yes_prob + no_prob)
+        # # Reweight yes and no to sum to 1
+        # yes_prob /= (yes_prob + no_prob)
 
-        print(f"Final YES Probability: {yes_prob}")
+        print(f"  Final YES Probability: {yes_prob}")
 
         assert 0 <= yes_prob <= 1, "Invalid probability value"
-        return yes_prob
+        return 1. - no_prob # yes_prob # for testing
     
     def query_vlm_batch(self, batched_subtrajectories):
         """
