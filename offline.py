@@ -735,15 +735,11 @@ def set_seed(seed):
     gym.utils.seeding.np_random(seed)
     d3rlpy.seed(seed)
 
-def generate_stitched_dataset(seed, dataset_name, expert_agent, n_episodes):
+def generate_stitched_dataset(seed, dataset_name, n_episodes):
     """Generate dataset where a random half of each episode is expert and the other half is anti-expert."""
     set_seed(seed)
 
     env = gym.make("Pendulum-v1", render_mode="rgb_array")
-
-    # Load expert agent
-    # expert_agent = d3rlpy.load_learnable(expert_path) # Was having issues loading to mps device
-    # expert_agent.build_with_env(env)
 
     observations, actions, rewards, terminations, truncations = [], [], [], [], []
 
@@ -760,13 +756,22 @@ def generate_stitched_dataset(seed, dataset_name, expert_agent, n_episodes):
 
         while not done and step < max_steps:
             print(f"Episode: {episode} Step: {step}")
+
+            # Get expert action
+            cos_theta, sin_theta, theta_dot = obs
+            theta = np.arctan2(sin_theta, cos_theta)
+            if theta <= -3 * np.pi / 4 or theta >= 3 * np.pi / 4: # Pendulum is pointed down
+                expert_action = np.array([.7]) if theta_dot > 0 else np.array([-.7]) # Pick up momentum
+            else:
+                expert_action = np.array([-70. * theta - 10. * theta_dot])  # PD control
+
+            # Decide which action to take
             if (expert_first and step < max_steps // 2) or (not expert_first and step >= max_steps // 2):
                 # Use Expert for this half
-                action = expert_agent.predict(np.array([obs]))[0]
+                action = expert_action
             else:
                 # Use Anti-Expert (inverted actions)
-                action = -10*expert_agent.predict(np.array([obs]))[0]
-                # action = expert_agent.predict(np.array([obs]))[0] For debugging. put back when done.
+                action = -10 * expert_action
 
             next_obs, reward, done, _, _ = env.step(action)
 
@@ -803,7 +808,7 @@ def generate_stitched_dataset(seed, dataset_name, expert_agent, n_episodes):
     print(f"Stitched dataset saved at {dataset_name}")
 
     # Visualize data
-    visualize_data("Pendulum-v1", mdp_dataset, "Pendulum_Stitched", episodes=[0,1,2]) # episodes=[0, 1, 2, 3, 250, 499])
+    visualize_data("Pendulum-v1", mdp_dataset, "Pendulum_Stitched", episodes=[0,1,2,3,4]) # episodes=[0, 1, 2, 3, 250, 499])
 
 def visualize_data(env_name, mdp_dataset, data_name, episodes=[0, 250, 499]):
     for ep_index in episodes:
@@ -832,6 +837,7 @@ if __name__ == "__main__":
     seed = 20
     data_name="Pendulum_Stitched" # "Pendulum-v1", "Pendulum_Stitched"
     algo="sfbc"
+    num_stitched_episodes = 500
 
     assert len(sys.argv) == 2, "Usage: python offline.py <openai_api_key or None>"
     OPENAI_API_KEY = sys.argv[1]
@@ -840,23 +846,8 @@ if __name__ == "__main__":
     if data_name == "Pendulum_Stitched" and not os.path.exists(STITCHED_PATH):
         stitch_seed = 20
         set_seed(stitch_seed)
-        # if there is no expert trained on original Pendulum dataset, train it
-        # if not os.path.exists(EXPERT_PATH):
-        print("Training expert on original Pendulum dataset...")
-        _, agent, _, _ = train(stitch_seed, data_name="Pendulum-v1", algo="awac", vis_data=False, num_steps=500) ############ bc?
-        for r_num in range(3): # Rollout expert
-            rollout(stitch_seed+r_num, agent, "Pendulum-v1", f"expert_pendulum_s{stitch_seed+r_num}.mp4")
-        # Move agent to CPU for faster rollout
-        # Manually move the model to CPU
-        # move_d3rl_agent_to_device(agent, "cpu") 
-        # agent.save(EXPERT_PATH) # Save expert model. Loading from disk somehow makes the agent tun much faster, but incorrectly.
-        # Generate stitched dataset
         print("Generating stitched dataset...")
-        generate_stitched_dataset(stitch_seed, STITCHED_PATH, agent, 500) # 1
-        # generate_stitched_dataset(stitch_seed, STITCHED_PATH, EXPERT_PATH, 500) # 1
-        # move agent back to mps device
-        # move agent back to mps device
-        # move_d3rl_agent_to_device(agent, "mps") 
+        generate_stitched_dataset(stitch_seed, STITCHED_PATH, num_stitched_episodes)
         print("Done generating data; please run the script again.")
         exit()
 
