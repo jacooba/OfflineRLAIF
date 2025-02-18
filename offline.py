@@ -24,6 +24,9 @@ from d3rlpy.metrics import EnvironmentEvaluator
 from io import BytesIO
 from PIL import Image
 
+# This is not working yet:
+# from weighted_bc import RewardWeightedBC
+
 STITCHED_PATH = "Pendulum_Stitched.h5"
 EXPERT_PATH = "Pendulum_Expert.d3"
 OPENAI_API_KEY = None
@@ -115,18 +118,23 @@ class sfbc:
             self.agent = d3rlpy.algos.AWACConfig().create(device="mps")
         else:
             # Do BC on filtered data
-            self.agent = d3rlpy.algos.BCConfig().create(device="mps")
+            if self.use_vlm_weights:
+                # Not working yet:
+                assert False, "Weighted BC not implemented yet."
+                # self.agent = RewardWeightedBC()
+            else:
+                self.agent = d3rlpy.algos.BCConfig().create(device="mps")
         # Build the model with dataset
         self.agent.build_with_dataset(filtered_dataset)
         # Fit the model
         if self.awac_instead:
-            self.agent.fit(unfiltered_dataset, **kwargs)
+            return self.agent.fit(unfiltered_dataset, **kwargs)
         else:
-            self.agent.fit(filtered_dataset, **kwargs)
+            return self.agent.fit(filtered_dataset, **kwargs)
 
     def predict(self, observation):
         # Predict the action
-        self.agent.predict(observation)
+        return self.agent.predict(observation)
 
     def get_confidence(self, dataset):
         """
@@ -337,7 +345,7 @@ class sfbc:
         filtered_dataset = MDPDataset(observations, actions, rewards, terminations, truncations)
 
         # Create an unfiltered version, where rewards are confidence scores
-        unfiltered_dataset = MDPDataset(np.array([ep.observations for ep in dataset.episodes]), np.array([ep.actions for ep in dataset.episodes]), 
+        unfiltered_dataset = MDPDataset(np.vstack([ep.observations for ep in dataset.episodes]), np.vstack([ep.actions for ep in dataset.episodes]), 
                                         unfiltered_rewards, unfiltered_terminations, unfiltered_truncations)
 
         return filtered_dataset, unfiltered_dataset

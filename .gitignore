@@ -2,3 +2,6 @@ Results/
 sfbc_videos/
 *.npy
 *.jsonl
+*.mp4
+*.png
+__pycache__
