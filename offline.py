@@ -93,16 +93,27 @@ class sfbc:
         save_path = f"{combined_hash}_vlm.npy"
 
         # Check if the confidence scores already exist
+        num_loaded = 0
         if os.path.exists(save_path):
-            print(f"VLM confidence scores found: {save_path}, loading instead of re-querying.")
-            return np.load(save_path)
-        
-        print(f"Querying VLM for confidence scores and saving to {save_path}...")
-        confidence_scores = []
+            # If the scores are complete, load them instead of re-querying
+            loaded_scores = np.load(save_path)
+            num_loaded = len(loaded_scores)
+            print(f"Found {num_loaded} VLM confidence scores saved at {save_path}")
+            if num_loaded == len(dataset.episodes):
+                print(f"VLM confidence scores are complete; loading instead.")
+                return loaded_scores
+            print(f"VLM confidence scores are incomplete; resuming queries...")
+            confidence_scores = list(loaded_scores)
+        else:
+            print(f"Querying VLM for confidence scores and saving to {save_path}...")
+            confidence_scores = []
 
         num_episodes = len(dataset.episodes)
         for n, episode in enumerate(dataset.episodes):
         # for n, episode in enumerate(dataset.episodes[:10]): # For testing
+            if n < num_loaded: # Skip already queried episodes
+                continue
+
             print(f"\nEpisode: {n+1}/{num_episodes}")
             episode_confidence_scores = []
             episode_frames = []
@@ -134,7 +145,7 @@ class sfbc:
                 vlm_conf = min(vlm_conf, 1.0)  # Clip to 1.0
                 print(f"  Combined VLM Confidence: {vlm_conf}\n")
                 # vlm_conf = random.random()  # For testing
-                episode_confidence_scores.append(vlm_conf)
+                episode_confidence_scores.append(vlm_conf)                
 
                 # Create videos for visualization
                 if self.visualize_data:
@@ -158,12 +169,10 @@ class sfbc:
 
             confidence_scores.append(episode_confidence_scores)
 
-        # Convert lists to NumPy arrays
-        confidence_scores = np.array(confidence_scores)
+            # Save confidence scores after each episode in case of interruption
+            np.save(save_path, np.array(confidence_scores))
 
-        # Save confidence scores
-        np.save(save_path, confidence_scores)
-        print(f"VLM confidence scores saved at {save_path}")
+        print(f"Complete VLM confidence scores saved at {save_path}")
 
         return confidence_scores
 
