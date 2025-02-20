@@ -33,7 +33,7 @@ def render_frame_to_base64(frame):
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 class sfbc:
-    def __init__(self, subtrajectory_len=100, vlm_confidence_threshold=0.05, visualize_data=True, 
+    def __init__(self, learning_rate=1e-3, critic_learning_rate=1e-5, subtrajectory_len=100, vlm_confidence_threshold=0.05, visualize_data=True, 
                  use_vlm_weights=False, subsample=20, env_name="Pendulum-v1", awac_instead=False):
         self.subtrajectory_len = subtrajectory_len
         self.vlm_confidence_threshold = vlm_confidence_threshold
@@ -43,6 +43,8 @@ class sfbc:
         self.env_name = env_name
         self.awac_instead = awac_instead
         self.visualize_data = visualize_data
+        self.learning_rate = learning_rate
+        self.critic_learning_rate = critic_learning_rate
         self.vlm_prompts = ["You are watching a video of a red stick. If the black dot is at the bottom of the stick, answer 'Y'. Otherwise, answer 'N'.",
                             "You are watching a video of a red stick. If the stick has moved between sides of the screen (left to right or right to left), answer 'Y'. Otherwise, answer 'N'."]
         self.client = openai.OpenAI(api_key=OPENAI_API_KEY)
@@ -55,13 +57,14 @@ class sfbc:
         # Make agent
         if self.awac_instead: 
             # Don't do BC on filtered data; do AWAC instead
-            self.agent = d3rlpy.algos.AWACConfig().create(device="mps")
+            self.agent = d3rlpy.algos.AWACConfig(actor_learning_rate=self.learning_rate, 
+                                                 critic_learning_rate=self.critic_learning_rate).create(device="mps")
         else:
             # Do BC on filtered data
             if self.use_vlm_weights:
-                self.agent = WBCConfig().create(device="mps")
+                self.agent = WBCConfig(learning_rate=self.learning_rate).create(device="mps")
             else:
-                self.agent = d3rlpy.algos.BCConfig().create(device="mps")
+                self.agent = d3rlpy.algos.BCConfig(learning_rate=self.learning_rate).create(device="mps")
         # Build the model with dataset
         self.agent.build_with_dataset(filtered_dataset)
         # Fit the model
@@ -172,6 +175,7 @@ class sfbc:
     def filter_dataset(self, dataset, confidence_scores):
         """
         Filters dataset using VLM saved scores and constructs a new MDPDataset.
+        Also clamp actions to [-2, 2] for Pendulum environment.
 
         Returns:
             MDPDataset: Filtered dataset with high-confidence sub-trajectories.
@@ -251,7 +255,7 @@ class sfbc:
     def query_vlm(self, subtrajectory, vlm_prompt, tries=3):
         """Queries OpenAI VLM for confidence score on a subtrajectory."""
         if tries == 0:
-            assert False, "VLM API Error: Max retries exceeded"
+            raise Exception("VLM API Error: Max retries exceeded")
         
         # Construct messages with system prompt + images
         messages = [
@@ -312,7 +316,9 @@ class sfbc:
         return 1. - no_prob # No probability is more reliable
 
 
-def train(seed, data_name="Pendulum_Stitched", algo="awac", vis_data=False, num_steps=500):
+def train(seed, lr, critic_lr, data_name="Pendulum_Stitched", algo="awac", 
+          vis_data=False, num_steps=500, eval_during_training=True):
+    
     assert data_name in ["Pendulum-v1", "Pendulum_Stitched", "antmaze-medium-play-v0"], "Invalid environment name"
     assert algo in ["awac", "bc", "td3+bc", "sfbc"], "Invalid agent name"
 
@@ -328,6 +334,35 @@ def train(seed, data_name="Pendulum_Stitched", algo="awac", vis_data=False, num_
             mdp_dataset = d3rlpy.dataset.ReplayBuffer.load(f, d3rlpy.dataset.InfiniteBuffer())
         env = gym.make("Pendulum-v1", render_mode="rgb_array")
         env_name = "Pendulum-v1"
+        # Print information about the dataset
+        all_actions = np.vstack([ep.actions for ep in mdp_dataset.episodes])
+        print("Min action:", all_actions.min())
+        print("Max action:", all_actions.max())
+        print("Mean action:", all_actions.mean())
+        print("Standard deviation:", all_actions.std())
+        # Clip actions to [-2, 2]
+        if all_actions.min() < -2 or all_actions.max() > 2:
+            print("Clipping actions to [-2, 2]")
+            all_actions = np.clip(all_actions, -2, 2)
+            # Copy the other data
+            all_obs = np.vstack([ep.observations for ep in mdp_dataset.episodes])
+            all_rewards = np.hstack([ep.rewards for ep in mdp_dataset.episodes])
+            all_terminations = []
+            all_truncations = []
+            for ep in mdp_dataset.episodes:
+                ep_terminations = [False] * len(ep.observations)
+                all_terminations.extend(ep_terminations)
+                ep_trunc = [False] * len(ep.observations)
+                ep_trunc[-1] = True  # Only set the last step as truncated
+                all_truncations.extend(ep_trunc)
+            all_terminations = np.hstack(all_terminations)
+            all_truncations = np.hstack(all_truncations)
+            # Convert to 1D array since MDPDataset expects flat truncations
+            all_truncations = np.hstack(all_truncations)
+            # Create a new MDPDataset
+            mdp_dataset = MDPDataset(all_obs, all_actions, all_rewards, all_terminations, all_truncations)
+            all_actions = np.vstack([ep.actions for ep in mdp_dataset.episodes])
+            assert all_actions.min() >= -2 and all_actions.max() <= 2, "Actions not clamped correctly"
     elif data_name == "antmaze-medium-play-v0":
         print("Currently Debugging this environment; may not work.")
         dataset = minari.load_dataset("D4RL/antmaze/medium-play-v1")
@@ -365,13 +400,15 @@ def train(seed, data_name="Pendulum_Stitched", algo="awac", vis_data=False, num_
 
     # Initialize model
     if algo == "awac":
-        agent = d3rlpy.algos.AWACConfig().create(device="mps")
+        agent = d3rlpy.algos.AWACConfig(actor_learning_rate=lr, 
+                                        critic_learning_rate=critic_lr).create(device="mps")
     elif algo == "bc":
-        agent = d3rlpy.algos.BCConfig().create(device="mps")
+        agent = d3rlpy.algos.BCConfig(learning_rate=lr).create(device="mps", learning_rate=lr)
     elif algo == "td3+bc":
-        agent = d3rlpy.algos.TD3PlusBCConfig().create(device="mps")
+        agent = d3rlpy.algos.TD3PlusBCConfig(actor_learning_rate=lr, 
+                                             critic_learning_rate=critic_lr).create(device="mps", learning_rate=lr)
     elif algo == "sfbc":
-        agent = sfbc(env_name=env_name)
+        agent = sfbc(env_name=env_name, learning_rate=lr, critic_learning_rate=critic_lr)
     print("model initialized:", agent)
 
     # Ensure the dataset is not empty
@@ -388,7 +425,8 @@ def train(seed, data_name="Pendulum_Stitched", algo="awac", vis_data=False, num_
     # Run one training step to check if it works
     agent.build_with_dataset(mdp_dataset)
     history = agent.fit(mdp_dataset, n_steps=num_steps, n_steps_per_epoch=50, show_progress=True, 
-        evaluators={'environment': env_evaluator}, logger_adapter=d3rlpy.logging.NoopAdapterFactory())
+        evaluators={'environment': env_evaluator} if eval_during_training else None, 
+        logger_adapter=d3rlpy.logging.NoopAdapterFactory())
     print("Done")
 
     return history, agent, env, env_name
@@ -420,13 +458,14 @@ def plot(history, plot_filename):
     plt.legend()
 
     # Plot Environment Rewards
-    env_rewards = [info["environment"] for step, info in history]
-    plt.subplot(1, 3, 3)
-    plt.plot(epochs, env_rewards, label="Environment Reward", color="green")
-    plt.xlabel("Epochs")
-    plt.ylabel("Reward")
-    plt.title("Reward Over Training")
-    plt.legend()
+    if "environment" in history[0][1]:
+        env_rewards = [info["environment"] for step, info in history]
+        plt.subplot(1, 3, 3)
+        plt.plot(epochs, env_rewards, label="Environment Reward", color="green")
+        plt.xlabel("Epochs")
+        plt.ylabel("Reward")
+        plt.title("Reward Over Training")
+        plt.legend()
 
     plt.tight_layout()
     
@@ -517,6 +556,7 @@ def generate_stitched_dataset(seed, dataset_name, n_episodes):
             else:
                 # Use Anti-Expert (inverted actions)
                 action = -10 * expert_action
+            action = np.clip(action, -2, 2)  # Clip to [-2, 2]
 
             next_obs, reward, done, _, _ = env.step(action)
 
@@ -572,6 +612,10 @@ if __name__ == "__main__":
     data_name="Pendulum_Stitched" # "Pendulum-v1", "Pendulum_Stitched"
     algo="sfbc"
     num_stitched_episodes = 500
+    lr = 1e-3 # 3e-3 (wsf) # 1e-3 (sf, default)
+    critic_learning_rate = 1e-5 # (seemed better for sf awac)
+    num_step = 1000 # 8000 (wsf) # 1850 (sf awac) 1000 (sf) # 500 (default)
+    eval_during_training = True
 
     assert len(sys.argv) == 2, "Usage: python offline.py <openai_api_key or None>"
     OPENAI_API_KEY = sys.argv[1]
@@ -588,7 +632,9 @@ if __name__ == "__main__":
     set_seed(seed)
 
     # Train
-    history, agent, env, env_name = train(seed, data_name=data_name, algo=algo, vis_data=False)
+    history, agent, env, env_name = train(seed, lr, critic_learning_rate,
+                                          data_name=data_name, algo=algo, vis_data=False, num_steps=num_step,
+                                          eval_during_training=eval_during_training,)
     # Plot
     plot(history, f"{algo}_plot_{data_name}_s{seed}.png")
     # Rollout
