@@ -554,8 +554,21 @@ def generate_stitched_dataset(seed, dataset_name, n_episodes):
                 # Use Expert for this half
                 action = expert_action
             else:
-                # Use Anti-Expert (inverted actions)
-                action = -10 * expert_action
+                # Use Anti-Expert
+                goal = np.pi if theta > 0 else -np.pi
+                if abs(theta - goal) < 0.1:
+                    # If at bottom, oppose velocity slightly
+                    action = np.array([-5. * theta_dot])  # D control
+                elif abs(theta) < 0.15: 
+                    # If at top, nudge to the right
+                    action = np.array([-0.1])
+                elif -7*np.pi/8 < theta < -np.pi/4:
+                    # Hard counter clockwise
+                    action = np.array([2.0])
+                else:
+                    # oppose velocity
+                    action = np.array([-200. * theta_dot])  # D control
+            
             action = np.clip(action, -2, 2)  # Clip to [-2, 2]
 
             next_obs, reward, done, _, _ = env.step(action)
