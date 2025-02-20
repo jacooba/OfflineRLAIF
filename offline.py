@@ -33,8 +33,9 @@ def render_frame_to_base64(frame):
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 class sfbc:
-    def __init__(self, learning_rate=1e-3, critic_learning_rate=1e-5, subtrajectory_len=100, vlm_confidence_threshold=0.05, visualize_data=True, 
-                 use_vlm_weights=False, subsample=20, env_name="Pendulum-v1", awac_instead=False):
+    def __init__(self, learning_rate=1e-3, critic_learning_rate=1e-5, subtrajectory_len=100, vlm_confidence_threshold=0.1, visualize_data=True, 
+                 use_vlm_weights=False, subsample=20, env_name="Pendulum-v1", 
+                 awac_instead=False, strict_filter=False):
         self.subtrajectory_len = subtrajectory_len
         self.vlm_confidence_threshold = vlm_confidence_threshold
         self.use_vlm_weights = use_vlm_weights
@@ -45,6 +46,7 @@ class sfbc:
         self.visualize_data = visualize_data
         self.learning_rate = learning_rate
         self.critic_learning_rate = critic_learning_rate
+        self.strict_filter = strict_filter
         self.vlm_prompts = ["You are watching a video of a red stick. If the black dot is at the bottom of the stick, answer 'Y'. Otherwise, answer 'N'.",
                             "You are watching a video of a red stick. If the stick has moved between sides of the screen (left to right or right to left), answer 'Y'. Otherwise, answer 'N'."]
         self.client = openai.OpenAI(api_key=OPENAI_API_KEY)
@@ -207,8 +209,17 @@ class sfbc:
                 index = i // self.subtrajectory_len
                 vlm_conf = episode_confidence_scores[index]
 
-                # Filter subtrajectory based on VLM confidence
-                if vlm_conf >= self.vlm_confidence_threshold:
+                # Define filtering
+                pass_filter = vlm_conf >= self.vlm_confidence_threshold
+                if self.strict_filter:
+                    # Strict filter: Do not include if next subtrajectory is low confidence
+                    if index < len(episode_confidence_scores) - 1:
+                        next_vlm_conf = episode_confidence_scores[index + 1]
+                        if next_vlm_conf < self.vlm_confidence_threshold:
+                            pass_filter = False
+
+                # Filter subtrajectory
+                if pass_filter:
                     episode_observations.extend(sub_obs)
                     episode_actions.extend(sub_act)
                     episode_rewards.extend(np.ones(len(sub_obs))*vlm_conf)  # Fill with confidence score
