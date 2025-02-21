@@ -339,7 +339,7 @@ class sfbc:
 def train(seed, lr, critic_lr, data_name="Pendulum_Stitched", algo="awac", 
           vis_data=False, num_steps=500, eval_during_training=True):
     
-    assert data_name in ["Pendulum-v1", "Pendulum_Stitched", "antmaze-medium-play-v0"], "Invalid environment name"
+    assert data_name in ["Pendulum-v1", "Pendulum_Stitched",], "Invalid environment name"
     assert algo in ["awac", "bc", "td3+bc", "sfbc"], "Invalid agent name"
 
     set_seed(seed)
@@ -383,35 +383,7 @@ def train(seed, lr, critic_lr, data_name="Pendulum_Stitched", algo="awac",
             mdp_dataset = MDPDataset(all_obs, all_actions, all_rewards, all_terminations, all_truncations)
             all_actions = np.vstack([ep.actions for ep in mdp_dataset.episodes])
             assert all_actions.min() >= -2 and all_actions.max() <= 2, "Actions not clamped correctly"
-    elif data_name == "antmaze-medium-play-v0":
-        print("Currently Debugging this environment; may not work.")
-        dataset = minari.load_dataset("D4RL/antmaze/medium-play-v1")
-        env = dataset.recover_environment()
-        def flatten_observation(obs):
-            return np.concatenate([obs['achieved_goal'], obs['desired_goal'], obs['observation']])
-        env = gym.wrappers.TransformObservation(env, flatten_observation)
-        episodes = list(dataset.iterate_episodes())
-        print("Number of episodes:", len(episodes))
 
-        # Extract data
-        # with properties 'id', 'observations', 'actions', 'rewards', 'terminations', 'truncations', 'infos']
-        observations = np.vstack([ep.observations["observation"] for ep in episodes])
-        actions = np.vstack([ep.actions for ep in episodes])
-        rewards = np.hstack([ep.rewards for ep in episodes])
-        terminals = np.hstack([ep.terminations for ep in episodes])
-        truncations = np.hstack([ep.truncations for ep in episodes])
-        print("Number of observations in episode 0:", len(episodes[0].observations["observation"]))
-        print("Number of actions in episode 0:", len(episodes[0].actions))
-        assert len(episodes[0].observations["observation"]) == len(episodes[0].actions) + 1
-
-        # Convert to d3rlpy format
-        mdp_dataset = MDPDataset(observations, actions, rewards, terminals, truncations)
-        print("Dataset size:", len(mdp_dataset.episodes))
-        # import pdb; pdb.set_trace()
-        print("MDP Dataset Episodes:", len(mdp_dataset.episodes))
-        assert len(mdp_dataset.episodes) > 0, "ERROR: No episodes found in MDPDataset!"
-        print("Sample episode:", mdp_dataset.episodes[:5])  # Print first 5 episodes
-        env_name = "antmaze-medium-play-v0"
     print("Dataset size:", len(mdp_dataset.episodes))
 
     # Visualize data
