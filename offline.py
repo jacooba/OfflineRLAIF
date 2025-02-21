@@ -33,9 +33,10 @@ def render_frame_to_base64(frame):
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 class sfbc:
-    def __init__(self, learning_rate=1e-3, critic_learning_rate=1e-5, subtrajectory_len=100, vlm_confidence_threshold=0.1, visualize_data=True, 
-                 use_vlm_weights=False, subsample=20, env_name="Pendulum-v1", 
-                 awac_instead=False, strict_filter=False):
+    def __init__(self, learning_rate=1e-3, critic_learning_rate=1e-5, visualize_data=True, 
+                 env_name="Pendulum-v1", subsample=20, subtrajectory_len=100,
+                 use_vlm_weights=True, awac_instead=False, strict_filter=True, vlm_confidence_threshold=0.1,
+                 td3bc_instead=False): 
         self.subtrajectory_len = subtrajectory_len
         self.vlm_confidence_threshold = vlm_confidence_threshold
         self.use_vlm_weights = use_vlm_weights
@@ -43,6 +44,8 @@ class sfbc:
         self.subsample = subsample
         self.env_name = env_name
         self.awac_instead = awac_instead
+        self.td3bc_instead = td3bc_instead
+        assert not (self.awac_instead and self.td3bc_instead), "Cannot use both AWAC and TD3+BC"
         self.visualize_data = visualize_data
         self.learning_rate = learning_rate
         self.critic_learning_rate = critic_learning_rate
@@ -58,9 +61,13 @@ class sfbc:
         filtered_dataset, unfiltered_dataset = self.filter_dataset(dataset, confidence_scores)
         # Make agent
         if self.awac_instead: 
-            # Don't do BC on filtered data; do AWAC instead
+            # Do AWAC instead
             self.agent = d3rlpy.algos.AWACConfig(actor_learning_rate=self.learning_rate, 
                                                  critic_learning_rate=self.critic_learning_rate).create(device="mps")
+        elif self.td3bc_instead:
+            # Do TD3+BC instead
+            self.agent = d3rlpy.algos.TD3PlusBCConfig(actor_learning_rate=self.learning_rate, 
+                                                     critic_learning_rate=self.critic_learning_rate).create(device="mps")
         else:
             # Do BC on filtered data
             if self.use_vlm_weights:
@@ -71,6 +78,8 @@ class sfbc:
         self.agent.build_with_dataset(filtered_dataset)
         # Fit the model
         if self.awac_instead:
+            return self.agent.fit(unfiltered_dataset, **kwargs)
+        elif self.td3bc_instead:
             return self.agent.fit(unfiltered_dataset, **kwargs)
         else:
             return self.agent.fit(filtered_dataset, **kwargs)
@@ -414,10 +423,10 @@ def train(seed, lr, critic_lr, data_name="Pendulum_Stitched", algo="awac",
         agent = d3rlpy.algos.AWACConfig(actor_learning_rate=lr, 
                                         critic_learning_rate=critic_lr).create(device="mps")
     elif algo == "bc":
-        agent = d3rlpy.algos.BCConfig(learning_rate=lr).create(device="mps", learning_rate=lr)
+        agent = d3rlpy.algos.BCConfig(learning_rate=lr).create(device="mps")
     elif algo == "td3+bc":
         agent = d3rlpy.algos.TD3PlusBCConfig(actor_learning_rate=lr, 
-                                             critic_learning_rate=critic_lr).create(device="mps", learning_rate=lr)
+                                             critic_learning_rate=critic_lr).create(device="mps")
     elif algo == "sfbc":
         agent = sfbc(env_name=env_name, learning_rate=lr, critic_learning_rate=critic_lr)
     print("model initialized:", agent)
@@ -538,6 +547,7 @@ def generate_stitched_dataset(seed, dataset_name, n_episodes):
 
     observations, actions, rewards, terminations, truncations = [], [], [], [], []
 
+    # Note: Starting in a more diverse range of states could help enable more generalization
     obs, _ = env.reset(seed=seed)
     for episode in range(n_episodes):
         obs, _ = env.reset()
@@ -636,10 +646,10 @@ if __name__ == "__main__":
     data_name="Pendulum_Stitched" # "Pendulum-v1", "Pendulum_Stitched"
     algo="sfbc"
     num_stitched_episodes = 500
-    lr = 1e-3 # 3e-3 (wsf) # 1e-3 (sf, default)
-    critic_learning_rate = 1e-5 # (seemed better for sf awac)
-    num_step = 1000 # 8000 (wsf) # 1850 (sf awac) 1000 (sf) # 500 (default)
-    eval_during_training = True
+    lr = 1e-3 # 1e-3 is the default from d3rlpy for BC; 3e-4 is the default for AWAC, TD3+BC
+    critic_learning_rate = 1e-3 # Note: 1e-5 looks marginally better for SF-AWAC; 3e-4 default for AWAC, TD3+BC
+    num_step = 8000
+    eval_during_training = False
 
     assert len(sys.argv) == 2, "Usage: python offline.py <openai_api_key or None>"
     OPENAI_API_KEY = sys.argv[1]
