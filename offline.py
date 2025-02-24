@@ -15,10 +15,12 @@ matplotlib.use("Agg")  # Use non-interactive backend on Mac
 
 import matplotlib.pyplot as plt
 
-from d3rlpy.dataset import MDPDataset
-from d3rlpy.metrics import EnvironmentEvaluator
 from io import BytesIO
 from PIL import Image
+from multiprocessing import Pool
+
+from d3rlpy.dataset import MDPDataset
+from d3rlpy.metrics import EnvironmentEvaluator
 
 from weighted_bc import WBCConfig
 
@@ -32,11 +34,31 @@ def render_frame_to_base64(frame):
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
+def train_and_eval(args): 
+    # pack agrgs for multiprocessing
+    seed, lr, critic_learning_rate, data_name, algo, num_step, eval_during_training = args
+    # Setup save dir
+    save_dir = f"Results/{algo}"
+    os.makedirs(save_dir, exist_ok=True)
+    # Set seed
+    set_seed(seed)
+
+    # Train
+    history, agent, _, env_name = train(seed, lr, critic_learning_rate,
+                                        data_name=data_name, algo=algo, vis_data=False, num_steps=num_step,
+                                        eval_during_training=eval_during_training,)
+    # Plot
+    plot(history, f"{save_dir}/plot_{data_name}_s{seed}.png")
+    # Rollout
+    r, succ = rollout(seed, agent, env_name, f"{save_dir}/trained_{data_name}_s{seed}.mp4")
+
+    return r, succ
+
 class sfbc:
     def __init__(self, learning_rate=1e-3, critic_learning_rate=1e-5, visualize_data=True, 
                  env_name="Pendulum-v1", subsample=20, subtrajectory_len=100,
-                 use_vlm_weights=False, strict_filter=True, vlm_confidence_threshold=0.1,
-                 td3bc_instead=False, awac_instead=False, sparse_prompt=True): 
+                 use_vlm_weights=True, strict_filter=True, vlm_confidence_threshold=0.1,
+                 td3bc_instead=False, awac_instead=False, sparse_prompt=False): 
         self.subtrajectory_len = subtrajectory_len
         self.vlm_confidence_threshold = vlm_confidence_threshold
         self.use_vlm_weights = use_vlm_weights
@@ -84,7 +106,8 @@ class sfbc:
         if self.awac_instead:
             return self.agent.fit(unfiltered_dataset, **kwargs)
         elif self.td3bc_instead:
-            return self.agent.fit(unfiltered_dataset, **kwargs)
+            # Given BC component, it helps to filter, but unfiltered_dataset can work
+            return self.agent.fit(filtered_dataset, **kwargs)
         else:
             return self.agent.fit(filtered_dataset, **kwargs)
 
@@ -473,8 +496,8 @@ def plot(history, plot_filename):
     # Save plot
     plt.savefig(plot_filename)
 
-def rollout(seed, agent, env_name, filename, n_episodes=1, fps=30, max_steps=1000):
-    print(f"Generating rollout video: {filename}")
+def rollout(seed, agent, env_name, filename, fps=30, max_steps=1000):
+    print(f"Generating rollout: {filename}")
     set_seed(seed) 
 
     # Get env from env_name:
@@ -491,24 +514,34 @@ def rollout(seed, agent, env_name, filename, n_episodes=1, fps=30, max_steps=100
 
     frames = []
     observation, _ = env.reset(seed=seed)
-    for _ in range(n_episodes):
-        observation, _ = env.reset()
-        done = False
-        while not done:
-            action = agent.predict(np.array([observation]))[0]  # Get policy action
-            observation, reward, done, _, _ = env.step(action)
-            frame = env.render()
-            if frame is None:
-                print("Warning: Environment did not return frames. Skipping video generation.")
-                return
-            frames.append(frame)
-            print(f"Step: {len(frames)} Reward: {reward} Done: {done}")
-            if len(frames) >= max_steps:
-                break
+    done = False
+    total_reward = 0.
+    num_frames = 0
+    is_verticals = []
+    while not done:
+        action = agent.predict(np.array([observation]))[0]  # Get policy action
+        observation, reward, done, _, _ = env.step(action)
+        total_reward += reward
+        # Determine whether vertical
+        cos_theta, sin_theta, _ = observation
+        theta = np.arctan2(sin_theta, cos_theta)
+        is_verticals.append(1 if abs(theta) <= 0.5 else 0)
+        frame = env.render()
+        num_frames += 1
+        if frame is None:
+            print("Warning: Environment did not return frames. Skipping video generation.")
+            return
+        frames.append(frame)
+        # print(f"Step: {len(frames)} Reward: {reward} Done: {done}")
+        if len(frames) >= max_steps:
+            break
 
     # Save video
     imageio.mimsave(filename, frames, fps=fps)
     print(f"Saved rollout video at {filename}")
+
+    success = int(sum(is_verticals) >= num_frames/2)
+    return total_reward, success
 
 def set_seed(seed):
     """Set random seed globally for reproducibility."""
@@ -608,7 +641,7 @@ def generate_stitched_dataset(seed, dataset_name, n_episodes):
     print(f"Stitched dataset saved at {dataset_name}")
 
     # Visualize data
-    visualize_data("Pendulum-v1", mdp_dataset, "Pendulum_Stitched", episodes=[0,1,2,3,4]) # episodes=[0, 1, 2, 3, 250, 499])
+    visualize_data("Pendulum-v1", mdp_dataset, "Pendulum_Stitched", episodes=[0,1,2,3,4])
 
 def visualize_data(env_name, mdp_dataset, data_name, episodes=[0, 250, 499]):
     for ep_index in episodes:
@@ -623,12 +656,12 @@ def visualize_data(env_name, mdp_dataset, data_name, episodes=[0, 250, 499]):
 
 
 if __name__ == "__main__":
-    seed = 20
-    data_name="Pendulum_Stitched" # "Pendulum-v1", "Pendulum_Stitched"
-    algo="sfbc"
+    seeds = [20, 73, 11, 46, 89, 18, 12, 37, 94, 83, 13, 53, 61, 77, 22,] # 15 seeds
+    data_name = "Pendulum_Stitched" # "Pendulum-v1", "Pendulum_Stitched"
+    algo = "bc"
     num_stitched_episodes = 500
-    lr = 1e-3 # 1e-3 is the default from d3rlpy for BC; 3e-4 is the default for AWAC, TD3+BC
-    critic_learning_rate = 1e-3 # Note: 1e-5 looks marginally better for SF-AWAC; 3e-4 default for AWAC, TD3+BC
+    lr = 1e-3 # 1e-3 is the default from d3rlpy for BC; 3e-4 is the default for AWAC, TD3+BC in d3rlpy
+    critic_learning_rate = 1e-3 # Note: 1e-5 looks marginally better for SF-AWAC; 3e-4 default for AWAC, TD3+BC in d3rlpy
     num_step = 8000
     eval_during_training = False
 
@@ -642,15 +675,19 @@ if __name__ == "__main__":
         print("Generating stitched dataset...")
         generate_stitched_dataset(stitch_seed, STITCHED_PATH, num_stitched_episodes)
         print("Done generating data; please run the script again.")
-        exit()
+        exit() # To allow for inspection before calling epensive OpenAI API
 
-    set_seed(seed)
-
-    # Train
-    history, agent, env, env_name = train(seed, lr, critic_learning_rate,
-                                          data_name=data_name, algo=algo, vis_data=False, num_steps=num_step,
-                                          eval_during_training=eval_during_training,)
-    # Plot
-    plot(history, f"{algo}_plot_{data_name}_s{seed}.png")
-    # Rollout
-    rollout(seed, agent, env_name, f"{algo}_trained_{data_name}_s{seed}.mp4")
+    # Train and evaluate asynchronously
+    pool = Pool(len(seeds))
+    pool_args = [(seed, lr, critic_learning_rate, 
+                  data_name, algo, num_step, eval_during_training) for seed in seeds]
+    returns, successes = zip(*pool.map(train_and_eval, pool_args))
+    pool.close()
+    print(f"\nDone evaluating {algo}...")
+    print("Returns:", returns)
+    print("Return Mean:", np.mean(list(returns)))
+    print("Return Std:", np.std(list(returns)))
+    print("Return Std Err:", np.std(list(returns)) / np.sqrt(len(returns)))
+    print("Successes:", successes)
+    print("Success Percent:", 100*np.mean(list(successes)))
+    print("\n")
