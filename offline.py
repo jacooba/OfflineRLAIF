@@ -35,8 +35,8 @@ def render_frame_to_base64(frame):
 class sfbc:
     def __init__(self, learning_rate=1e-3, critic_learning_rate=1e-5, visualize_data=True, 
                  env_name="Pendulum-v1", subsample=20, subtrajectory_len=100,
-                 use_vlm_weights=True, awac_instead=False, strict_filter=True, vlm_confidence_threshold=0.1,
-                 td3bc_instead=False): 
+                 use_vlm_weights=False, strict_filter=True, vlm_confidence_threshold=0.1,
+                 td3bc_instead=False, awac_instead=False, sparse_prompt=True): 
         self.subtrajectory_len = subtrajectory_len
         self.vlm_confidence_threshold = vlm_confidence_threshold
         self.use_vlm_weights = use_vlm_weights
@@ -50,8 +50,12 @@ class sfbc:
         self.learning_rate = learning_rate
         self.critic_learning_rate = critic_learning_rate
         self.strict_filter = strict_filter
-        self.vlm_prompts = ["You are watching a video of a red stick. If the black dot is at the bottom of the stick, answer 'Y'. Otherwise, answer 'N'.",
-                            "You are watching a video of a red stick. If the stick has moved between sides of the screen (left to right or right to left), answer 'Y'. Otherwise, answer 'N'."]
+        self.sparse_prompt = sparse_prompt
+        if sparse_prompt:
+            self.vlm_prompts = ["You are watching a video of a red stick. If the black dot is at the bottom of the stick, answer 'Y'. Otherwise, answer 'N'.",]
+        else:
+            self.vlm_prompts = ["You are watching a video of a red stick. If the black dot is at the bottom of the stick, answer 'Y'. Otherwise, answer 'N'.",
+                                "You are watching a video of a red stick. If the stick has moved between sides of the screen (left to right or right to left), answer 'Y'. Otherwise, answer 'N'."]
         self.client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
     def fit(self, dataset, **kwargs):
@@ -96,8 +100,11 @@ class sfbc:
         dataset_hash = hashlib.md5(np.stack(dataset.episodes[0].observations).tobytes()).hexdigest()
         algo_hash = hashlib.md5(f"{self.subtrajectory_len}_{self.subsample}".encode()).hexdigest()
         combined_hash = hashlib.md5(f"{dataset_hash}_{algo_hash}".encode()).hexdigest()
+        identifier = combined_hash
+        if self.sparse_prompt:
+            identifier = "sparse_" + identifier
         # Save path for numpty array of confidence scores
-        save_path = f"{combined_hash}_vlm.npy"
+        save_path = f"{identifier}_vlm.npy"
 
         # Check if the confidence scores already exist
         num_loaded = 0
@@ -169,10 +176,12 @@ class sfbc:
                         episode_frames.append(blended_frame)
 
             if self.visualize_data:
+                # Video directory
+                vid_dir = "sfbc_videos_"+identifier
                 # Create directory if it doesn't exist
-                os.makedirs("sfbc_videos", exist_ok=True)
+                os.makedirs(vid_dir, exist_ok=True)
                 # Save video
-                imageio.mimsave(f"sfbc_videos/sfbc_ep{n+1}.mp4", episode_frames, fps=30)
+                imageio.mimsave(f"{vid_dir}/sfbc_ep{n+1}.mp4", episode_frames, fps=30)
 
             confidence_scores.append(episode_confidence_scores)
 
