@@ -662,8 +662,8 @@ if __name__ == "__main__":
     data_name = "Pendulum_Stitched" # "Pendulum-v1", "Pendulum_Stitched"
     algo = "sfbc"
     num_stitched_episodes = 500
-    lr = 1e-3 # 1e-3 is the default from d3rlpy for BC; 3e-4 is the default for AWAC, TD3+BC in d3rlpy
-    critic_learning_rate = 1e-3 # Note: 1e-5 looks marginally better for SF-AWAC; 3e-4 default for AWAC, TD3+BC in d3rlpy
+    lr = 1e-3 if algo in ["bc", "sfbc"] else 3e-4 # defaults from d3rlpy
+    critic_learning_rate = 1e-3 if algo in ["bc", "sfbc"] else 3e-4 # defaults from d3rlpy
     num_step = 8000
     eval_during_training = False
     save_rollout_videos = True
