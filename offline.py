@@ -28,6 +28,16 @@ STITCHED_PATH = "Pendulum_Stitched.h5"
 OPENAI_API_KEY = None # Set Later
 DEVICE = "mps"  # MPS imroves TD3+BC, minor slowdown for BC
 
+def render_trajectory_base64(render_env, observations):
+    base64_frames = []
+    for state in observations:
+        render_env.reset()
+        render_env.unwrapped.state = np.arctan2(state[1], state[0]), state[2]
+        frame = render_env.render()
+        base64_image = render_frame_to_base64(frame)
+        base64_frames.append(base64_image)
+    return base64_frames, frame # Return base64_frames, last frame
+
 def render_frame_to_base64(frame):
     """Convert a rendered frame (numpy array) to a base64-encoded string."""
     img = Image.fromarray(frame)
@@ -54,6 +64,244 @@ def train_and_eval(args):
     r, succ = rollout(seed, agent, env_name, f"{save_dir}/trained_{data_name}_s{seed}.mp4", save_rollout_videos)
 
     return r, succ
+
+class pref_agent:
+    def __init__(self, learning_rate=1e-3, visualize_data=True, 
+                 env_name="Pendulum-v1", subsample=20, subtrajectory_len=100,
+                 use_vlm_weights=True, vlm_confidence_threshold=0.1, sparse=False): 
+        self.subtrajectory_len = subtrajectory_len
+        self.vlm_confidence_threshold = vlm_confidence_threshold
+        self.use_vlm_weights = use_vlm_weights
+        self.bc_agent = None
+        self.subsample = subsample
+        self.env_name = env_name
+        self.visualize_data = visualize_data
+        self.learning_rate = learning_rate
+        self.sparse = sparse
+        if self.sparse:
+            self.system_prompt = ("You are watching two videos of a red stick."
+                                " The higher the stick, the better."
+                                " Respond '1' if Video 1 is better, '2' if Video 2 is better.")
+        else:
+            self.system_prompt = ("You are watching two videos of a red stick."
+                                " The goal is to swing the stick up to gain height."
+                                " It is bad to let it fall and lose momentum."
+                                " Respond '1' if Video 1 is better, '2' if Video 2 is better.")
+        self.video1_prompt = "Video 1:"
+        self.video2_prompt = "Video 2:"
+        self.client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+    def fit(self, dataset, **kwargs):
+        # Query VLM for preference scores, if not already done
+        preferences = self.get_preferences(dataset)
+        exit()
+        # Add preferences and other trajectories to batches in the dataset
+        augmented_dataset = self.augment_dataset(dataset, preferences)
+        # Make agent
+        self.agent = None #TODO agent(learning_rate=self.learning_rate).create(device=DEVICE)
+        # Build the model with dataset
+        self.agent.build_with_dataset(augmented_dataset)
+        # Fit the model
+        return self.agent.fit(augmented_dataset, **kwargs)
+
+    def predict(self, observation):
+        # Predict the action
+        return self.agent.predict(observation)
+    
+    def augment_dataset(self, dataset, preferences):
+        pass
+    
+    def get_preferences(self, dataset):
+        """
+        Queries VLM for preference scores on dataset and returns the scores.
+        """
+        # Compute hash of dataset (using observations & actions)
+        dataset_hash = hashlib.md5(np.stack(dataset.episodes[0].observations).tobytes()).hexdigest()
+        algo_hash = hashlib.md5(f"{self.subtrajectory_len}_{self.subsample}".encode()).hexdigest()
+        combined_hash = hashlib.md5(f"{dataset_hash}_{algo_hash}".encode()).hexdigest()
+        identifier = combined_hash
+        if self.sparse:
+            identifier = "sparse_" + identifier
+        # Save path for numpty array of confidpreferenceence scores
+        save_path = f"pref_{identifier}_vlm.npy"
+
+        # Check if the preference scores already exist
+        num_loaded = 0
+        if os.path.exists(save_path):
+            # If the scores are complete, load them instead of re-querying
+            loaded_scores = np.load(save_path)
+            num_loaded = len(loaded_scores)
+            print(f"Found {num_loaded} VLM preference scores saved at {save_path}")
+            if num_loaded == len(dataset.episodes):
+                print(f"VLM preference scores are complete; loading instead.")
+                return loaded_scores
+            print(f"VLM preference scores are incomplete; resuming queries...")
+            preference_tuples = list(loaded_scores)
+        else:
+            print(f"Querying VLM for preference scores and saving to {save_path}...")
+            preference_tuples = []
+
+        num_episodes = len(dataset.episodes)
+        for n, episode in enumerate(dataset.episodes):
+        # for n, episode in enumerate(dataset.episodes[:10]): # For testing
+            if n < num_loaded: # Skip already queried episodes
+                continue
+
+            print(f"\nEpisode: {n+1}/{num_episodes}")
+            episode_preference_tuples = []
+            episode_frames = []
+
+            num_obs = len(episode.observations)
+            assert num_obs % self.subtrajectory_len == 0, "Subtrajectory length must divide episode length"
+            for i in range(0, len(episode.observations), self.subtrajectory_len):
+                print(f"  Observation: {i}-{i+self.subtrajectory_len}/{num_obs}")
+                sub_obs_video1 = episode.observations[i:i+self.subtrajectory_len]
+                
+                # randommly sample an episode for comparison
+                j = random.randint(0, num_episodes-1)
+                # randommly sample a subtrajectory for comparison
+                potential_start_indices = list(range(0, len(episode.observations), self.subtrajectory_len))
+                potential_start_indices.remove(i)
+                k = random.choice(potential_start_indices)
+
+                sub_obs_video2 = dataset.episodes[j].observations[k:k+self.subtrajectory_len]
+
+                # Subsample subtrajectories
+                short_sub_obs1 = sub_obs_video1[::self.subsample]
+                short_sub_obs2 = sub_obs_video2[::self.subsample]
+
+                # Convert numpy arrays to frames
+                render_env = gym.make(self.env_name, render_mode="rgb_array")
+                base64_frames_vid1, last_frame = render_trajectory_base64(render_env, short_sub_obs1)
+                base64_frames_vid2, last_frame = render_trajectory_base64(render_env, short_sub_obs2)
+
+                # Get VLM preference scores
+                pref = self.query_vlm(base64_frames_vid1, base64_frames_vid2)
+                # Append preference for i, episode index for comparison, subtrajectory index for comparison               
+                episode_preference_tuples.append((pref, j, k)) 
+
+                # Create videos for visualization
+                if self.visualize_data:
+                    overlay1 = np.zeros_like(last_frame, dtype=np.uint8)
+                    overlay2 = np.zeros_like(last_frame, dtype=np.uint8)
+                    if pref > 0.5:
+                        overlay1[:, :, 1] = 200 # Green tint
+                        overlay2[:, :, 0] = 200 # Red tint
+                    if pref < 0.5:
+                        overlay1[:, :, 0] = 200 # Red tint
+                        overlay2[:, :, 1] = 200 # Green tint
+                    
+                    for obs1, obs2 in zip(sub_obs_video1, sub_obs_video2):
+                        # Video 1 frame
+                        render_env.reset()
+                        render_env.unwrapped.state = np.arctan2(obs1[1], obs1[0]), obs1[2]
+                        frame1 = render_env.render()
+                        # Video 2 frame
+                        render_env.reset()
+                        render_env.unwrapped.state = np.arctan2(obs2[1], obs2[0]), obs2[2]
+                        frame2 = render_env.render()
+                        # Blend frames
+                        blended_frame_1 = (0.85 * frame1 + 0.15 * overlay1).astype(np.uint8)
+                        blended_frame_2 = (0.85 * frame2 + 0.15 * overlay2).astype(np.uint8)
+                        # Stack frames next to each other
+                        blended_frame = np.hstack([blended_frame_1, blended_frame_2])
+                        episode_frames.append(blended_frame)
+
+            if self.visualize_data:
+                # Video directory
+                vid_dir = "pref_videos_"+identifier
+                # Create directory if it doesn't exist
+                os.makedirs(vid_dir, exist_ok=True)
+                # Save video
+                imageio.mimsave(f"{vid_dir}/sfbc_ep{n+1}.mp4", episode_frames, fps=30)
+
+            preference_tuples.append(episode_preference_tuples)
+
+            # Save confidence scores after each episode in case of interruption
+            np.save(save_path, np.array(preference_tuples))
+
+        print(f"Complete VLM confidence scores saved at {save_path}")
+
+        return preference_tuples
+
+    def build_with_dataset(self, dataset):
+        return # Do later after filtering
+
+    def query_vlm(self, subtrajectory1, subtrajectory2, tries=3):
+        """Queries OpenAI VLM for confidence score on a subtrajectory."""
+        if tries == 0:
+            raise Exception("VLM API Error: Max retries exceeded")
+        
+        # Construct messages with system prompt + images
+        messages = [
+            {"role": "system", "content": self.system_prompt},  # Set system prompt
+            {"role": "user", "content": [{"type": "text", "text": self.video1_prompt}]},
+            {"role": "user", "content": [{"type": "text", "text": self.video2_prompt}]}
+        ]
+
+        # Append each base64-encoded image to the user message correctly
+        for base64_image in subtrajectory1:
+            messages[1]["content"].append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{base64_image}", "detail": "low"}  # Correct format
+            })
+        for base64_image in subtrajectory2:
+            messages[2]["content"].append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{base64_image}", "detail": "low"}  # Correct format
+            })
+
+        try:
+            # OpenAI API call using new client
+            response = self.client.chat.completions.create(
+                model="gpt-4o", # gpt-4o-mini (does not work well) or gpt-4o
+                messages=messages,
+                max_tokens=1,  # We only want a 1/2 response
+                logprobs=True,  # Ensure we get log probabilities
+                temperature=0,  # Make it deterministic
+                top_logprobs=5,  # Get logprobs for the top 5 tokens,
+            )
+
+        except Exception as e:
+            print(f"  VLM API Error: {e}")
+            return self.query_vlm(subtrajectory1, subtrajectory2, tries - 1)
+
+        # Extract the most likely token
+        choice = response.choices[0]
+        predicted_token = choice.message.content.strip().lower()
+        print(f"  VLM Response: {predicted_token}")
+
+        # Extract logprobs from the response
+        one_prob = 0.0
+        two_prob = 0.0
+
+        # Yes/No Variants
+        one_variants = {"1", "one",}
+        two_variants = {"2", "two",}
+
+        # Extract top log probabilities
+        if choice.logprobs:
+            for type, logprob_entry in choice.logprobs:
+                if type == "content":
+                    for token_entry in logprob_entry:
+                        token = token_entry.token.strip().lower()
+                        prob = np.exp(token_entry.logprob)  # Convert log-prob to prob
+                        if token in one_variants:
+                            one_prob += prob
+                        elif token in two_variants:
+                            two_prob += prob
+
+        print(f"  Aggregated YES Probability: {one_prob}, Aggregated NO Probability: {two_prob}")
+
+        # Return .5 if probabilities are equal. This also covers the case where both are zero.
+        if one_prob == two_prob:
+            return 0.5
+        
+        # Normalize probabilities
+        one_prob = one_prob / (one_prob + two_prob)
+
+        assert 0 <= one_prob <= 1, "Invalid probability value"
+        return one_prob
 
 class sfbc:
     def __init__(self, learning_rate=1e-3, critic_learning_rate=1e-5, visualize_data=True, 
@@ -373,7 +621,7 @@ def train(seed, lr, critic_lr, data_name="Pendulum_Stitched", algo="awac",
           vis_data=False, num_steps=500, eval_during_training=True):
     
     assert data_name in ["Pendulum-v1", "Pendulum_Stitched",], "Invalid environment name"
-    assert algo in ["awac", "bc", "td3+bc", "sfbc"], "Invalid agent name"
+    assert algo in ["awac", "bc", "td3+bc", "sfbc", "dpo"], "Invalid agent name"
 
     set_seed(seed)
 
@@ -434,6 +682,8 @@ def train(seed, lr, critic_lr, data_name="Pendulum_Stitched", algo="awac",
                                              critic_learning_rate=critic_lr).create(device=DEVICE)
     elif algo == "sfbc":
         agent = sfbc(env_name=env_name, learning_rate=lr, critic_learning_rate=critic_lr)
+    elif algo == "dpo":
+        agent = pref_agent(env_name=env_name, learning_rate=lr)
     print("model initialized:", agent)
 
     # Ensure the dataset is not empty
@@ -659,18 +909,30 @@ def visualize_data(env_name, mdp_dataset, data_name, episodes=[0, 250, 499]):
 
 
 if __name__ == "__main__":
-    seeds = [20, 73, 11, 46, 89, 18, 12, 37, 94, 83, 13, 53, 61, 77, 22,] # 15 seeds
+    seeds = [20] # [20, 73, 11, 46, 89, 18, 12, 37, 94, 83, 13, 53, 61, 77, 22,] # 15 seeds
     data_name = "Pendulum_Stitched" # "Pendulum-v1", "Pendulum_Stitched"
-    algo = "sfbc"
+    algo = "dpo" # "awac", "bc", "td3+bc", "sfbc", "dpo"
     num_stitched_episodes = 500
-    lr = 1e-3 if algo in ["bc", "sfbc"] else 3e-4 # defaults from d3rlpy
-    critic_learning_rate = 1e-3 if algo in ["bc", "sfbc"] else 3e-4 # defaults from d3rlpy
+    lr = 1e-3 if algo in ["bc", "sfbc", "dpo"] else 3e-4 # defaults from d3rlpy
+    critic_learning_rate = lr
     num_step = 8000
     eval_during_training = False
     save_rollout_videos = True
 
     assert len(sys.argv) == 2, "Usage: python offline.py <openai_api_key or None>"
     OPENAI_API_KEY = sys.argv[1]
+
+    # If using mutliple seeds, assert that there is a file that matches "pref_*_vlm.npy" 
+    if algo == "dpo" and len(seeds) > 1:
+        for file in os.listdir():
+            if file.startswith("pref_") and file.endswith("_vlm.npy"):
+                # Check to make sure the file is complete
+                pref_vlm = np.load(file)
+                if len(pref_vlm) == num_stitched_episodes:
+                    break
+        else:
+            raise FileNotFoundError("No VLM preferences found, and it is too expensive to generate for each seed. " 
+                                    "Please generate the VLM preferences first with a single seed.")
 
     # If there is no "Pendulum_Stitched" dataset locally, create it
     if data_name == "Pendulum_Stitched" and not os.path.exists(STITCHED_PATH):
