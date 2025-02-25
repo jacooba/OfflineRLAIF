@@ -25,7 +25,8 @@ from d3rlpy.metrics import EnvironmentEvaluator
 from weighted_bc import WBCConfig
 
 STITCHED_PATH = "Pendulum_Stitched.h5"
-OPENAI_API_KEY = None
+OPENAI_API_KEY = None # Set Later
+DEVICE = "mps"  # MPS imroves TD3+BC, minor slowdown for BC
 
 def render_frame_to_base64(frame):
     """Convert a rendered frame (numpy array) to a base64-encoded string."""
@@ -89,17 +90,17 @@ class sfbc:
         if self.awac_instead: 
             # Do AWAC instead
             self.agent = d3rlpy.algos.AWACConfig(actor_learning_rate=self.learning_rate, 
-                                                 critic_learning_rate=self.critic_learning_rate).create(device="mps")
+                                                 critic_learning_rate=self.critic_learning_rate).create(device=DEVICE)
         elif self.td3bc_instead:
             # Do TD3+BC instead
             self.agent = d3rlpy.algos.TD3PlusBCConfig(actor_learning_rate=self.learning_rate, 
-                                                     critic_learning_rate=self.critic_learning_rate).create(device="mps")
+                                                     critic_learning_rate=self.critic_learning_rate).create(device=DEVICE)
         else:
             # Do BC on filtered data
             if self.use_vlm_weights:
-                self.agent = WBCConfig(learning_rate=self.learning_rate).create(device="mps")
+                self.agent = WBCConfig(learning_rate=self.learning_rate).create(device=DEVICE)
             else:
-                self.agent = d3rlpy.algos.BCConfig(learning_rate=self.learning_rate).create(device="mps")
+                self.agent = d3rlpy.algos.BCConfig(learning_rate=self.learning_rate).create(device=DEVICE)
         # Build the model with dataset
         self.agent.build_with_dataset(filtered_dataset)
         # Fit the model
@@ -425,12 +426,12 @@ def train(seed, lr, critic_lr, data_name="Pendulum_Stitched", algo="awac",
     # Initialize model
     if algo == "awac":
         agent = d3rlpy.algos.AWACConfig(actor_learning_rate=lr, 
-                                        critic_learning_rate=critic_lr).create(device="mps")
+                                        critic_learning_rate=critic_lr).create(device=DEVICE)
     elif algo == "bc":
-        agent = d3rlpy.algos.BCConfig(learning_rate=lr).create(device="mps")
+        agent = d3rlpy.algos.BCConfig(learning_rate=lr).create(device=DEVICE)
     elif algo == "td3+bc":
         agent = d3rlpy.algos.TD3PlusBCConfig(actor_learning_rate=lr, 
-                                             critic_learning_rate=critic_lr).create(device="mps")
+                                             critic_learning_rate=critic_lr).create(device=DEVICE)
     elif algo == "sfbc":
         agent = sfbc(env_name=env_name, learning_rate=lr, critic_learning_rate=critic_lr)
     print("model initialized:", agent)
