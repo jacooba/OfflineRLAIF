@@ -36,7 +36,7 @@ def render_frame_to_base64(frame):
 
 def train_and_eval(args): 
     # pack agrgs for multiprocessing
-    seed, lr, critic_learning_rate, data_name, algo, num_step, eval_during_training = args
+    seed, lr, critic_learning_rate, save_rollout_videos, data_name, algo, num_step, eval_during_training = args
     # Setup save dir
     save_dir = f"Results/{algo}"
     os.makedirs(save_dir, exist_ok=True)
@@ -50,7 +50,7 @@ def train_and_eval(args):
     # Plot
     plot(history, f"{save_dir}/plot_{data_name}_s{seed}.png")
     # Rollout
-    r, succ = rollout(seed, agent, env_name, f"{save_dir}/trained_{data_name}_s{seed}.mp4")
+    r, succ = rollout(seed, agent, env_name, f"{save_dir}/trained_{data_name}_s{seed}.mp4", save_rollout_videos)
 
     return r, succ
 
@@ -106,8 +106,8 @@ class sfbc:
         if self.awac_instead:
             return self.agent.fit(unfiltered_dataset, **kwargs)
         elif self.td3bc_instead:
-            # Given BC component, it helps to filter, but unfiltered_dataset can work
-            return self.agent.fit(filtered_dataset, **kwargs)
+            # Given BC component, you can also filter
+            return self.agent.fit(unfiltered_dataset, **kwargs)
         else:
             return self.agent.fit(filtered_dataset, **kwargs)
 
@@ -496,7 +496,7 @@ def plot(history, plot_filename):
     # Save plot
     plt.savefig(plot_filename)
 
-def rollout(seed, agent, env_name, filename, fps=30, max_steps=1000):
+def rollout(seed, agent, env_name, filename, save_rollout_videos, fps=30, max_steps=1000):
     print(f"Generating rollout: {filename}")
     set_seed(seed) 
 
@@ -516,7 +516,7 @@ def rollout(seed, agent, env_name, filename, fps=30, max_steps=1000):
     observation, _ = env.reset(seed=seed)
     done = False
     total_reward = 0.
-    num_frames = 0
+    step_num = 0
     is_verticals = []
     while not done:
         action = agent.predict(np.array([observation]))[0]  # Get policy action
@@ -526,21 +526,23 @@ def rollout(seed, agent, env_name, filename, fps=30, max_steps=1000):
         cos_theta, sin_theta, _ = observation
         theta = np.arctan2(sin_theta, cos_theta)
         is_verticals.append(1 if abs(theta) <= 0.5 else 0)
-        frame = env.render()
-        num_frames += 1
-        if frame is None:
-            print("Warning: Environment did not return frames. Skipping video generation.")
-            return
-        frames.append(frame)
+        step_num += 1
+        if save_rollout_videos:
+            frame = env.render()
+            if frame is None:
+                print("Warning: Environment did not return frames. Skipping video generation.")
+                save_rollout_videos = False
+            frames.append(frame)
         # print(f"Step: {len(frames)} Reward: {reward} Done: {done}")
-        if len(frames) >= max_steps:
+        if step_num >= max_steps:
             break
 
     # Save video
-    imageio.mimsave(filename, frames, fps=fps)
-    print(f"Saved rollout video at {filename}")
+    if save_rollout_videos:
+        imageio.mimsave(filename, frames, fps=fps)
+        print(f"Saved rollout video at {filename}")
 
-    success = int(sum(is_verticals) >= num_frames/2)
+    success = int(sum(is_verticals) >= step_num/2)
     return total_reward, success
 
 def set_seed(seed):
@@ -658,12 +660,13 @@ def visualize_data(env_name, mdp_dataset, data_name, episodes=[0, 250, 499]):
 if __name__ == "__main__":
     seeds = [20, 73, 11, 46, 89, 18, 12, 37, 94, 83, 13, 53, 61, 77, 22,] # 15 seeds
     data_name = "Pendulum_Stitched" # "Pendulum-v1", "Pendulum_Stitched"
-    algo = "bc"
+    algo = "sfbc"
     num_stitched_episodes = 500
     lr = 1e-3 # 1e-3 is the default from d3rlpy for BC; 3e-4 is the default for AWAC, TD3+BC in d3rlpy
     critic_learning_rate = 1e-3 # Note: 1e-5 looks marginally better for SF-AWAC; 3e-4 default for AWAC, TD3+BC in d3rlpy
     num_step = 8000
     eval_during_training = False
+    save_rollout_videos = True
 
     assert len(sys.argv) == 2, "Usage: python offline.py <openai_api_key or None>"
     OPENAI_API_KEY = sys.argv[1]
@@ -678,11 +681,12 @@ if __name__ == "__main__":
         exit() # To allow for inspection before calling epensive OpenAI API
 
     # Train and evaluate asynchronously
-    pool = Pool(len(seeds))
-    pool_args = [(seed, lr, critic_learning_rate, 
+    pool = Pool(min(8, len(seeds))) # Note, this can hang when writing files if too many processes
+    pool_args = [(seed, lr, critic_learning_rate, save_rollout_videos,
                   data_name, algo, num_step, eval_during_training) for seed in seeds]
     returns, successes = zip(*pool.map(train_and_eval, pool_args))
     pool.close()
+    pool.join()
     print(f"\nDone evaluating {algo}...")
     print("Returns:", returns)
     print("Return Mean:", np.mean(list(returns)))
