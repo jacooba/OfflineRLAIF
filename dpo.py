@@ -38,16 +38,23 @@ class BCModules(BCBaseModules):
     imitator: Union[DeterministicPolicy, NormalPolicy]
 
 def compute_dpo_loss(
-    policy: DeterministicPolicy, x: TorchObservation, action: torch.Tensor, pref: torch.Tensor, beta: float = 1.0
+    policy: DeterministicPolicy, x: TorchObservation, action: torch.Tensor, pref: torch.Tensor, 
+    loss_per_action: bool, observation_dim: int, beta: float = 1.0,
 ) -> ImitationLoss:
     batch_size = x.shape[0]
-    time_steps = x.shape[1] // 2 // 3  # Since we concatenate two trajectories and 3 state dimensions
+    time_steps = x.shape[1] if loss_per_action else x.shape[1] * x.shape[2] // (2 * observation_dim)
 
     # Reshape observations to separate two trajectories
-    observations = x.reshape(batch_size, time_steps, 2, 3)  # (batch, time, 2 trajectories, state_dim)
-    sub_observations1, sub_observations2 = observations[:, :, 0, :], observations[:, :, 1, :]  # Separate trajectories
-    actions = action.reshape(batch_size, time_steps, 2)  # (batch, time, 2 actions)
-    sub_actions1, sub_actions2 = actions[:, :, 0], actions[:, :, 1]
+    if loss_per_action:
+        observations = x.reshape(batch_size, time_steps, 2, observation_dim)
+        sub_observations1, sub_observations2 = observations[:, :, 0, :], observations[:, :, 1, :]  # Separate trajectories
+        actions = action.reshape(batch_size, time_steps, 2)  # (batch, time, 2 actions)
+        sub_actions1, sub_actions2 = actions[:, :, 0], actions[:, :, 1]
+    else:
+        observations = x.reshape(batch_size, 2, time_steps, observation_dim)
+        sub_observations1, sub_observations2 = observations[:, 0, :, :], observations[:, 1, :, :]  # Separate trajectories
+        actions = action.reshape(batch_size, 2, time_steps)  # (batch, 2 actions, time)
+        sub_actions1, sub_actions2 = actions[:, 0, :], actions[:, 1, :]
 
     # Flatten time dimension before passing to policy
     flat_obs1 = sub_observations1.reshape(batch_size * time_steps, -1)  # (batch * time, state_dim)
@@ -112,6 +119,8 @@ class DPOConfig(LearnableConfig):
     policy_type: str = "deterministic"
     optim_factory: OptimizerFactory = make_optimizer_field()
     encoder_factory: EncoderFactory = make_encoder_field()
+    loss_per_action: bool = False
+    obs_shape: Shape = (3,)
 
     def create(
         self, device: DeviceArg = False, enable_ddp: bool = False
@@ -128,8 +137,8 @@ class DPO(QLearningAlgoBase[BCBaseImpl, BCConfig]):
     ) -> None:
         assert self._config.policy_type == "deterministic"
         imitator = create_deterministic_policy(
-            (3,), # observation_shape, # Overriding observation_shape to 3 for pendulum
-            1, # action_size, # Overriding action_size to 1 for pendulum
+            self._config.obs_shape,
+            1,
             self._config.encoder_factory,
             device=self._device,
             enable_ddp=self._enable_ddp,
@@ -143,6 +152,9 @@ class DPO(QLearningAlgoBase[BCBaseImpl, BCConfig]):
 
         modules = BCModules(optim=optim, imitator=imitator)
 
+        assert len(self._config.obs_shape) == 1, "DPO only supports 1D observations"
+        observation_dim = self._config.obs_shape[0]
+
         self._impl = DPOImpl(
             observation_shape=observation_shape,
             action_size=action_size,
@@ -150,6 +162,8 @@ class DPO(QLearningAlgoBase[BCBaseImpl, BCConfig]):
             policy_type=self._config.policy_type,
             compiled=self.compiled,
             device=self._device,
+            loss_per_action=self._config.loss_per_action,
+            actual_obs_dim=observation_dim,
         )
 
     def get_action_type(self) -> ActionSpace:
@@ -212,6 +226,8 @@ class BCBaseImpl(QLearningAlgoImplBase, metaclass=ABCMeta):
 class DPOImpl(BCBaseImpl):
     _modules: BCModules
     _policy_type: str
+    _loss_per_action: bool
+    _actual_obs_dim: int
 
     def __init__(
         self,
@@ -221,6 +237,8 @@ class DPOImpl(BCBaseImpl):
         policy_type: str,
         compiled: bool,
         device: str,
+        loss_per_action: bool,
+        actual_obs_dim: int,
     ):
         super().__init__(
             observation_shape=observation_shape,
@@ -230,6 +248,8 @@ class DPOImpl(BCBaseImpl):
             device=device,
         )
         self._policy_type = policy_type
+        self._loss_per_action = loss_per_action
+        self._actual_obs_dim = actual_obs_dim # The observation dimension for a single observation
 
     def inner_predict_best_action(self, x: TorchObservation) -> torch.Tensor:
         return self._modules.imitator(x).squashed_mu
@@ -240,7 +260,7 @@ class DPOImpl(BCBaseImpl):
         assert self._policy_type == "deterministic"
         assert isinstance(self._modules.imitator, DeterministicPolicy)
         return compute_dpo_loss(
-            self._modules.imitator, obs_t, act_t, pref_t,
+            self._modules.imitator, obs_t, act_t, pref_t, self._loss_per_action, self._actual_obs_dim,
         )
 
     @property

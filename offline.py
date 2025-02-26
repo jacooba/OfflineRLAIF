@@ -68,8 +68,8 @@ def train_and_eval(args):
 
 class pref_agent:
     def __init__(self, learning_rate=1e-3, visualize_data=True, 
-                 env_name="Pendulum-v1", subsample=20, subtrajectory_len=100,
-                 use_vlm_weights=True, vlm_confidence_threshold=0.1, sparse=False): 
+                 env_name="Pendulum-v1", subsample=20, subtrajectory_len=100, loss_per_action=False,
+                 use_vlm_weights=True, vlm_confidence_threshold=0.1, sparse=True): 
         self.subtrajectory_len = subtrajectory_len
         self.vlm_confidence_threshold = vlm_confidence_threshold
         self.use_vlm_weights = use_vlm_weights
@@ -79,6 +79,7 @@ class pref_agent:
         self.visualize_data = visualize_data
         self.learning_rate = learning_rate
         self.sparse = sparse
+        self.loss_per_action = loss_per_action
         if self.sparse:
             self.system_prompt = ("You are watching two videos of a red stick."
                                 " The higher the stick, the better."
@@ -98,7 +99,9 @@ class pref_agent:
         # Add preferences and other trajectories to batches in the dataset
         augmented_dataset = self.augment_dataset(dataset, preferences)
         # Make agent
-        self.agent = DPOConfig(learning_rate=self.learning_rate).create(device=DEVICE)
+        self.agent = DPOConfig(learning_rate=self.learning_rate, 
+                               loss_per_action=self.loss_per_action,
+                               obs_shape=(3,)).create(device=DEVICE)
         # Build the model with dataset
         self.agent.build_with_dataset(augmented_dataset)
         # Fit the model
@@ -139,18 +142,20 @@ class pref_agent:
                 sub_act2 = dataset.episodes[j].actions[k:k+self.subtrajectory_len]
 
                 # Define new dataset
-                # Combine subtrajectories
-                combined_obs = np.concatenate([sub_obs1, sub_obs2], axis=-1)
-                combined_act = np.concatenate([sub_act1, sub_act2], axis=-1)
-                # Flatten subtrajectories
-                combined_obs = combined_obs.reshape(-1,)
-                combined_act = combined_act.reshape(-1,)
-                # Add to dataset
-                episode_observations.append(combined_obs)
-                episode_actions.append(combined_act)
-                episode_rewards.append(pref)  # Fill with preference score
-                episode_terminations.append(False)
-                episode_truncations.append(False)
+                if self.loss_per_action:
+                    # Add each joint action separately within the subtrajectory
+                    episode_observations.extend([[o1, o2] for o1, o2 in zip(sub_obs1, sub_obs2)])
+                    episode_actions.extend([[a1, a2] for a1, a2 in zip(sub_act1, sub_act2)])
+                    episode_rewards.extend([pref] * len(sub_obs1)) 
+                    episode_terminations.extend([False] * len(sub_obs1))
+                    episode_truncations.extend([False] * len(sub_obs1))
+                else:
+                    # Add to dataset
+                    episode_observations.append([sub_obs1, sub_obs2])
+                    episode_actions.append([sub_act1, sub_act2])
+                    episode_rewards.append(pref)
+                    episode_terminations.append(False)
+                    episode_truncations.append(False)
 
             observations.append(episode_observations)
             actions.append(episode_actions)
@@ -160,11 +165,12 @@ class pref_agent:
             truncations.append(episode_truncations)
 
         # Convert lists to NumPy arrays
-        observations = np.vstack(observations)
-        actions = np.vstack(actions)
-        rewards = np.hstack(rewards)
-        terminations = np.hstack(terminations)
-        truncations = np.hstack(truncations)
+        obs_per_ep = num_obs if self.loss_per_action else (len(episode.observations) // self.subtrajectory_len)
+        observations = np.array(observations).reshape(num_episodes, obs_per_ep, -1)  # Flatten observations
+        actions = np.array(actions).reshape(num_episodes, obs_per_ep, -1) # Flatten actions
+        rewards = np.array(rewards).reshape(-1,)
+        terminations = np.array(terminations).reshape(-1,)
+        truncations = np.array(truncations).reshape(-1,)
 
         # Convert to d3rlpy dataset
         augmented_dataset = MDPDataset(observations, actions, rewards, terminations, truncations)
@@ -971,7 +977,7 @@ def visualize_data(env_name, mdp_dataset, data_name, episodes=[0, 250, 499]):
 
 
 if __name__ == "__main__":
-    seeds = [20] # [20, 73, 11, 46, 89, 18, 12, 37, 94, 83, 13, 53, 61, 77, 22,] # 15 seeds
+    seeds = [20, 73, 11, 46, 89, 18, 12, 37, 94, 83, 13, 53, 61, 77, 22,] # 15 seeds
     data_name = "Pendulum_Stitched" # "Pendulum-v1", "Pendulum_Stitched"
     algo = "dpo" # "awac", "bc", "td3+bc", "sfbc", "dpo"
     num_stitched_episodes = 500
