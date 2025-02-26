@@ -28,6 +28,7 @@ from dpo import DPOConfig
 STITCHED_PATH = "Pendulum_Stitched.h5"
 OPENAI_API_KEY = None # Set Later
 DEVICE = "mps"  # MPS imroves TD3+BC, minor slowdown for BC
+SINGLE_SEED = False
 
 def render_trajectory_base64(render_env, observations):
     base64_frames = []
@@ -46,9 +47,9 @@ def render_frame_to_base64(frame):
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-def train_and_eval(args): 
-    # pack agrgs for multiprocessing
-    seed, lr, critic_learning_rate, save_rollout_videos, data_name, algo, num_step, eval_during_training = args
+def train_and_eval(seed, lr, critic_learning_rate, save_rollout_videos, data_name, 
+        algo, num_step, eval_during_training): 
+    
     # Setup save dir
     save_dir = f"Results/{algo}"
     os.makedirs(save_dir, exist_ok=True)
@@ -68,11 +69,10 @@ def train_and_eval(args):
 
 class pref_agent:
     def __init__(self, learning_rate=1e-3, visualize_data=True, 
-                 env_name="Pendulum-v1", subsample=20, subtrajectory_len=100, loss_per_action=False,
-                 use_vlm_weights=True, vlm_confidence_threshold=0.1, sparse=True): 
+                 env_name="Pendulum-v1", subsample=20, subtrajectory_len=100,
+                 vlm_confidence_threshold=0.1, sparse=False, loss_per_action=False): 
         self.subtrajectory_len = subtrajectory_len
         self.vlm_confidence_threshold = vlm_confidence_threshold
-        self.use_vlm_weights = use_vlm_weights
         self.bc_agent = None
         self.subsample = subsample
         self.env_name = env_name
@@ -171,7 +171,7 @@ class pref_agent:
         rewards = np.array(rewards).reshape(-1,)
         terminations = np.array(terminations).reshape(-1,)
         truncations = np.array(truncations).reshape(-1,)
-
+    
         # Convert to d3rlpy dataset
         augmented_dataset = MDPDataset(observations, actions, rewards, terminations, truncations)
 
@@ -300,6 +300,8 @@ class pref_agent:
         if tries == 0:
             raise Exception("VLM API Error: Max retries exceeded")
         
+        assert SINGLE_SEED, "Only one seed should be used for querying VLM; Multiple is dangerous"
+        
         # Construct messages with system prompt + images
         messages = [
             {"role": "system", "content": self.system_prompt},  # Set system prompt
@@ -359,7 +361,7 @@ class pref_agent:
                         elif token in two_variants:
                             two_prob += prob
 
-        print(f"  Aggregated YES Probability: {one_prob}, Aggregated NO Probability: {two_prob}")
+        print(f"  Aggregated 1 Probability: {one_prob}, Aggregated 2 Probability: {two_prob}")
 
         # Return .5 if probabilities are equal. This also covers the case where both are zero.
         if one_prob == two_prob:
@@ -625,6 +627,8 @@ class sfbc:
         """Queries OpenAI VLM for confidence score on a subtrajectory."""
         if tries == 0:
             raise Exception("VLM API Error: Max retries exceeded")
+        
+        assert SINGLE_SEED, "Only one seed should be used for querying VLM; Multiple is dangerous"
         
         # Construct messages with system prompt + images
         messages = [
@@ -979,7 +983,7 @@ def visualize_data(env_name, mdp_dataset, data_name, episodes=[0, 250, 499]):
 if __name__ == "__main__":
     seeds = [20, 73, 11, 46, 89, 18, 12, 37, 94, 83, 13, 53, 61, 77, 22,] # 15 seeds
     data_name = "Pendulum_Stitched" # "Pendulum-v1", "Pendulum_Stitched"
-    algo = "dpo" # "awac", "bc", "td3+bc", "sfbc", "dpo"
+    algo = "td3+bc" # "awac", "bc", "td3+bc", "sfbc", "dpo"
     num_stitched_episodes = 500
     lr = 1e-3 if algo in ["bc", "sfbc", "dpo"] else 3e-4 # defaults from d3rlpy
     critic_learning_rate = lr
@@ -990,17 +994,8 @@ if __name__ == "__main__":
     assert len(sys.argv) == 2, "Usage: python offline.py <openai_api_key or None>"
     OPENAI_API_KEY = sys.argv[1]
 
-    # If using mutliple seeds, assert that there is a file that matches "pref_*_vlm.npy" 
-    if algo == "dpo" and len(seeds) > 1:
-        for file in os.listdir():
-            if file.startswith("pref_") and file.endswith("_vlm.npy"):
-                # Check to make sure the file is complete
-                pref_vlm = np.load(file)
-                if len(pref_vlm) == num_stitched_episodes:
-                    break
-        else:
-            raise FileNotFoundError("No VLM preferences found, and it is too expensive to generate for each seed. " 
-                                    "Please generate the VLM preferences first with a single seed.")
+    if len(seeds) == 1:
+        SINGLE_SEED = True
 
     # If there is no "Pendulum_Stitched" dataset locally, create it
     if data_name == "Pendulum_Stitched" and not os.path.exists(STITCHED_PATH):
@@ -1011,17 +1006,18 @@ if __name__ == "__main__":
         print("Done generating data; please run the script again.")
         exit() # To allow for inspection before calling epensive OpenAI API
 
-    # Train and evaluate asynchronously
+    # Train and evaluate
     if len(seeds) > 1:
-        pool = Pool(min(8, len(seeds))) # Note, this can hang when writing files if too many processes
+        # Asynchronous training
+        pool = Pool(min(8, len(seeds))) # Too many seeds causes script to hang
         pool_args = [(seed, lr, critic_learning_rate, save_rollout_videos,
                     data_name, algo, num_step, eval_during_training) for seed in seeds]
-        returns, successes = zip(*pool.map(train_and_eval, pool_args))
+        returns, successes = zip(*pool.starmap(train_and_eval, pool_args))
         pool.close()
         pool.join()
     else:
-        r, succ = train_and_eval((seeds[0], lr, critic_learning_rate, save_rollout_videos,
-                                            data_name, algo, num_step, eval_during_training))
+        r, succ = train_and_eval(seeds[0], lr, critic_learning_rate, save_rollout_videos,
+                                            data_name, algo, num_step, eval_during_training)
         returns = [r]
         successes = [succ]
     print(f"\nDone evaluating {algo}...")
