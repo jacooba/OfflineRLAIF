@@ -23,6 +23,7 @@ from d3rlpy.dataset import MDPDataset
 from d3rlpy.metrics import EnvironmentEvaluator
 
 from weighted_bc import WBCConfig
+from dpo import DPOConfig
 
 STITCHED_PATH = "Pendulum_Stitched.h5"
 OPENAI_API_KEY = None # Set Later
@@ -94,11 +95,10 @@ class pref_agent:
     def fit(self, dataset, **kwargs):
         # Query VLM for preference scores, if not already done
         preferences = self.get_preferences(dataset)
-        exit()
         # Add preferences and other trajectories to batches in the dataset
         augmented_dataset = self.augment_dataset(dataset, preferences)
         # Make agent
-        self.agent = None #TODO agent(learning_rate=self.learning_rate).create(device=DEVICE)
+        self.agent = DPOConfig(learning_rate=self.learning_rate).create(device=DEVICE)
         # Build the model with dataset
         self.agent.build_with_dataset(augmented_dataset)
         # Fit the model
@@ -109,7 +109,67 @@ class pref_agent:
         return self.agent.predict(observation)
     
     def augment_dataset(self, dataset, preferences):
-        pass
+        print(f"Creating augmented dataset with preferences")
+
+        observations, actions, rewards, terminations, truncations = [], [], [], [], []
+
+        num_episodes = len(dataset.episodes)
+        for n, episode in enumerate(dataset.episodes):
+            print(f"\nEpisode: {n+1}/{num_episodes}")
+            episode_observations, episode_actions, episode_rewards = [], [], []
+            episode_terminations, episode_truncations = [], []
+
+            # Get VLM preferences score
+            episode_preference_tuples = preferences[n]
+
+            num_obs = len(episode.observations)
+            assert num_obs % self.subtrajectory_len == 0, "Subtrajectory length must divide episode length"
+            for i in range(0, len(episode.observations), self.subtrajectory_len):
+                print(f"  Observation: {i}-{i+self.subtrajectory_len}/{num_obs}")
+                sub_obs1 = episode.observations[i:i+self.subtrajectory_len]
+                sub_act1 = episode.actions[i:i+self.subtrajectory_len]
+
+                # Get VLM preferences
+                index = i // self.subtrajectory_len
+                pref, j, k = episode_preference_tuples[index]
+                j, k = int(j), int(k)
+
+                # Get the other subtrajectory
+                sub_obs2 = dataset.episodes[j].observations[k:k+self.subtrajectory_len]
+                sub_act2 = dataset.episodes[j].actions[k:k+self.subtrajectory_len]
+
+                # Define new dataset
+                # Combine subtrajectories
+                combined_obs = np.concatenate([sub_obs1, sub_obs2], axis=-1)
+                combined_act = np.concatenate([sub_act1, sub_act2], axis=-1)
+                # Flatten subtrajectories
+                combined_obs = combined_obs.reshape(-1,)
+                combined_act = combined_act.reshape(-1,)
+                # Add to dataset
+                episode_observations.append(combined_obs)
+                episode_actions.append(combined_act)
+                episode_rewards.append(pref)  # Fill with preference score
+                episode_terminations.append(False)
+                episode_truncations.append(False)
+
+            observations.append(episode_observations)
+            actions.append(episode_actions)
+            rewards.append(episode_rewards)
+            terminations.append(episode_terminations)
+            episode_truncations[-1] = True  # Mark as truncated
+            truncations.append(episode_truncations)
+
+        # Convert lists to NumPy arrays
+        observations = np.vstack(observations)
+        actions = np.vstack(actions)
+        rewards = np.hstack(rewards)
+        terminations = np.hstack(terminations)
+        truncations = np.hstack(truncations)
+
+        # Convert to d3rlpy dataset
+        augmented_dataset = MDPDataset(observations, actions, rewards, terminations, truncations)
+
+        return augmented_dataset
     
     def get_preferences(self, dataset):
         """
@@ -122,6 +182,8 @@ class pref_agent:
         identifier = combined_hash
         if self.sparse:
             identifier = "sparse_" + identifier
+        if self.subtrajectory_len == 600:
+            identifier = "full_" + identifier
         # Save path for numpty array of confidpreferenceence scores
         save_path = f"pref_{identifier}_vlm.npy"
 
@@ -220,7 +282,7 @@ class pref_agent:
             # Save confidence scores after each episode in case of interruption
             np.save(save_path, np.array(preference_tuples))
 
-        print(f"Complete VLM confidence scores saved at {save_path}")
+        print(f"Complete VLM preference scores saved at {save_path}")
 
         return preference_tuples
 
@@ -944,12 +1006,18 @@ if __name__ == "__main__":
         exit() # To allow for inspection before calling epensive OpenAI API
 
     # Train and evaluate asynchronously
-    pool = Pool(min(8, len(seeds))) # Note, this can hang when writing files if too many processes
-    pool_args = [(seed, lr, critic_learning_rate, save_rollout_videos,
-                  data_name, algo, num_step, eval_during_training) for seed in seeds]
-    returns, successes = zip(*pool.map(train_and_eval, pool_args))
-    pool.close()
-    pool.join()
+    if len(seeds) > 1:
+        pool = Pool(min(8, len(seeds))) # Note, this can hang when writing files if too many processes
+        pool_args = [(seed, lr, critic_learning_rate, save_rollout_videos,
+                    data_name, algo, num_step, eval_during_training) for seed in seeds]
+        returns, successes = zip(*pool.map(train_and_eval, pool_args))
+        pool.close()
+        pool.join()
+    else:
+        r, succ = train_and_eval((seeds[0], lr, critic_learning_rate, save_rollout_videos,
+                                            data_name, algo, num_step, eval_during_training))
+        returns = [r]
+        successes = [succ]
     print(f"\nDone evaluating {algo}...")
     print("Returns:", returns)
     print("Return Mean:", np.mean(list(returns)))
