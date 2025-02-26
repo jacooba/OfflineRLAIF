@@ -70,9 +70,8 @@ def train_and_eval(seed, lr, critic_learning_rate, save_rollout_videos, data_nam
 class pref_agent:
     def __init__(self, learning_rate=1e-3, visualize_data=True, 
                  env_name="Pendulum-v1", subsample=20, subtrajectory_len=100,
-                 vlm_confidence_threshold=0.1, sparse=False, loss_per_action=False): 
+                 sparse=False, loss_per_action=False): 
         self.subtrajectory_len = subtrajectory_len
-        self.vlm_confidence_threshold = vlm_confidence_threshold
         self.bc_agent = None
         self.subsample = subsample
         self.env_name = env_name
@@ -983,7 +982,7 @@ def visualize_data(env_name, mdp_dataset, data_name, episodes=[0, 250, 499]):
 if __name__ == "__main__":
     seeds = [20, 73, 11, 46, 89, 18, 12, 37, 94, 83, 13, 53, 61, 77, 22,] # 15 seeds
     data_name = "Pendulum_Stitched" # "Pendulum-v1", "Pendulum_Stitched"
-    algo = "td3+bc" # "awac", "bc", "td3+bc", "sfbc", "dpo"
+    algo = "dpo" # "awac", "bc", "td3+bc", "sfbc", "dpo"
     num_stitched_episodes = 500
     lr = 1e-3 if algo in ["bc", "sfbc", "dpo"] else 3e-4 # defaults from d3rlpy
     critic_learning_rate = lr
