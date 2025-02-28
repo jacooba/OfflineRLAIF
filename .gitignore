@@ -6,3 +6,4 @@ sfbc_videos/
 *.png
 __pycache__
 Feedback Backup/
+d3rlpy_data/
