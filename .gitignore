@@ -7,3 +7,5 @@ sfbc_videos/
 __pycache__
 Feedback Backup/
 d3rlpy_data/
+Figs/
+*.pdf
