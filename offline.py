@@ -140,21 +140,15 @@ class pref_agent:
                 sub_obs2 = dataset.episodes[j].observations[k:k+self.subtrajectory_len]
                 sub_act2 = dataset.episodes[j].actions[k:k+self.subtrajectory_len]
 
-                # Define new dataset
-                if self.loss_per_action:
-                    # Add each joint action separately within the subtrajectory
-                    episode_observations.extend([[o1, o2] for o1, o2 in zip(sub_obs1, sub_obs2)])
-                    episode_actions.extend([[a1, a2] for a1, a2 in zip(sub_act1, sub_act2)])
-                    episode_rewards.extend([pref] * len(sub_obs1)) 
-                    episode_terminations.extend([False] * len(sub_obs1))
-                    episode_truncations.extend([False] * len(sub_obs1))
-                else:
-                    # Add to dataset
-                    episode_observations.append([sub_obs1, sub_obs2])
-                    episode_actions.append([sub_act1, sub_act2])
-                    episode_rewards.append(pref)
-                    episode_terminations.append(False)
-                    episode_truncations.append(False)
+                # Combine subtrajectories in feature dimension
+                combined_obs = np.concatenate([sub_obs1, sub_obs2], axis=-1)
+                combined_act = np.concatenate([sub_act1, sub_act2], axis=-1)
+                # Add to dataset
+                episode_observations.extend(combined_obs)
+                episode_actions.extend(combined_act)
+                episode_rewards.append(pref)
+                episode_terminations.append(False)
+                episode_truncations.append(False)
 
             observations.append(episode_observations)
             actions.append(episode_actions)
@@ -164,12 +158,14 @@ class pref_agent:
             truncations.append(episode_truncations)
 
         # Convert lists to NumPy arrays
-        obs_per_ep = num_obs if self.loss_per_action else (len(episode.observations) // self.subtrajectory_len)
-        observations = np.array(observations).reshape(num_episodes, obs_per_ep, -1)  # Flatten observations
-        actions = np.array(actions).reshape(num_episodes, obs_per_ep, -1) # Flatten actions
-        rewards = np.array(rewards).reshape(-1,)
-        terminations = np.array(terminations).reshape(-1,)
-        truncations = np.array(truncations).reshape(-1,)
+        # Flatten observations and actions from (episodes, num subtrajectories, subtrajectory_len, 2 trajectories * 3 obs dim)
+        observations = np.stack(observations, axis=0)
+        assert observations.shape == (num_episodes, num_obs, 2*3), "Invalid shape"
+        actions = np.stack(actions, axis=0)
+        assert actions.shape == (num_episodes, num_obs, 2), "Invalid shape"
+        rewards = np.hstack(rewards)
+        terminations = np.hstack(terminations)
+        truncations = np.hstack(truncations)
     
         # Convert to d3rlpy dataset
         augmented_dataset = MDPDataset(observations, actions, rewards, terminations, truncations)
@@ -373,8 +369,8 @@ class pref_agent:
         return one_prob
 
 class sfbc:
-    def __init__(self, learning_rate=1e-3, critic_learning_rate=1e-5, visualize_data=True, 
-                 env_name="Pendulum-v1", subsample=20, subtrajectory_len=100,
+    def __init__(self, learning_rate=1e-3, critic_learning_rate=1e-3, visualize_data=True, 
+                 env_name="Pendulum-v1", subsample=20, subtrajectory_len=600,
                  use_vlm_weights=True, strict_filter=True, vlm_confidence_threshold=0.1,
                  td3bc_instead=False, awac_instead=False, sparse_prompt=False): 
         self.subtrajectory_len = subtrajectory_len
@@ -444,6 +440,8 @@ class sfbc:
         identifier = combined_hash
         if self.sparse_prompt:
             identifier = "sparse_" + identifier
+        if self.subtrajectory_len == 600:
+            identifier = "full_" + identifier
         # Save path for numpty array of confidence scores
         save_path = f"{identifier}_vlm.npy"
 
@@ -980,9 +978,9 @@ def visualize_data(env_name, mdp_dataset, data_name, episodes=[0, 250, 499]):
 
 
 if __name__ == "__main__":
-    seeds = [20, 73, 11, 46, 89, 18, 12, 37, 94, 83, 13, 53, 61, 77, 22,] # 15 seeds
+    seeds = [20, 73, 11, 46, 89, 18, 12, 37, 94, 83, 13, 53, 61, 77, 22,] # 15 seeds # [20] for single seed
     data_name = "Pendulum_Stitched" # "Pendulum-v1", "Pendulum_Stitched"
-    algo = "dpo" # "awac", "bc", "td3+bc", "sfbc", "dpo"
+    algo = "sfbc" # "awac", "bc", "td3+bc", "sfbc", "dpo"
     num_stitched_episodes = 500
     lr = 1e-3 if algo in ["bc", "sfbc", "dpo"] else 3e-4 # defaults from d3rlpy
     critic_learning_rate = lr

@@ -42,27 +42,24 @@ def compute_dpo_loss(
     loss_per_action: bool, observation_dim: int, beta: float = 1.0,
 ) -> ImitationLoss:
     batch_size = x.shape[0]
-    time_steps = x.shape[1] if loss_per_action else x.shape[1] * x.shape[2] // (2 * observation_dim)
+    time_steps = x.shape[1]
+
+    if loss_per_action:
+        raise NotImplementedError("DPO does not yet support loss_per_action=True")
 
     # Reshape observations to separate two trajectories
-    if loss_per_action:
-        observations = x.reshape(batch_size, time_steps, 2, observation_dim)
-        sub_observations1, sub_observations2 = observations[:, :, 0, :], observations[:, :, 1, :]  # Separate trajectories
-        actions = action.reshape(batch_size, time_steps, 2)  # (batch, time, 2 actions)
-        sub_actions1, sub_actions2 = actions[:, :, 0], actions[:, :, 1]
-    else:
-        observations = x.reshape(batch_size, 2, time_steps, observation_dim)
-        sub_observations1, sub_observations2 = observations[:, 0, :, :], observations[:, 1, :, :]  # Separate trajectories
-        actions = action.reshape(batch_size, 2, time_steps)  # (batch, 2 actions, time)
-        sub_actions1, sub_actions2 = actions[:, 0, :], actions[:, 1, :]
+    observations = x.reshape(batch_size, time_steps, 2*observation_dim)
+    sub_observations1, sub_observations2 = observations[:, :, :observation_dim], observations[:, :, observation_dim:]
+    actions = action.reshape(batch_size, time_steps, 2)
+    sub_actions1, sub_actions2 = actions[:, :, :1], actions[:, :, 1:]
 
     # Flatten time dimension before passing to policy
-    flat_obs1 = sub_observations1.reshape(batch_size * time_steps, -1)  # (batch * time, state_dim)
-    flat_obs2 = sub_observations2.reshape(batch_size * time_steps, -1)
+    flat_obs1 = sub_observations1.reshape(batch_size * time_steps, observation_dim)  # (batch * time, state_dim)
+    flat_obs2 = sub_observations2.reshape(batch_size * time_steps, observation_dim)
 
     # Flatten actions
-    sub_actions1 = sub_actions1.reshape(batch_size * time_steps, -1)
-    sub_actions2 = sub_actions2.reshape(batch_size * time_steps, -1)
+    sub_actions1 = sub_actions1.reshape(batch_size * time_steps, 1)
+    sub_actions2 = sub_actions2.reshape(batch_size * time_steps, 1)
 
     # Get log probabilities from policy
     log_probs1 = -0.5 * (policy(flat_obs1).squashed_mu - sub_actions1)**2 # Assuming NormalPolicy
