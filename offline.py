@@ -370,7 +370,7 @@ class pref_agent:
 
 class sfbc:
     def __init__(self, learning_rate=1e-3, critic_learning_rate=1e-3, visualize_data=True, 
-                 env_name="Pendulum-v1", subsample=20, subtrajectory_len=600,
+                 env_name="Pendulum-v1", subsample=20, subtrajectory_len=100,
                  use_vlm_weights=True, strict_filter=True, vlm_confidence_threshold=0.1,
                  td3bc_instead=False, awac_instead=False, sparse_prompt=False): 
         self.subtrajectory_len = subtrajectory_len
