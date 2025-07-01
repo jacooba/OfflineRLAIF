@@ -1,6 +1,6 @@
 # SFO: Piloting VLM Feedback for Offline RL
 
-This repository contains the implementation of **Sub-Trajectory Filtered Behavior Cloning (SFBC)**, a method that leverages **vision-language model (VLM) feedback** to improve offline reinforcement learning (RL). SFBC filters and weights sub-trajectories based on VLM-derived success probabilities, enabling effective policy learning in the **absence of explicit rewards**.
+This repository contains code for the paper [*SFO: Piloting VLM Feedback for Offline RL* (Beck et al., 2025)](https://arxiv.org/abs/2503.01062), published at [The RLC Workshop on Reinforcement Learning Beyond Rewards: Ingredients for Developing Generalist Agents](https://proceedings.mlr.press/v205/beck23a.html). The code includes an implementation of **Sub-Trajectory Filtered Behavior Cloning (SFBC)**, a method that leverages **vision-language model (VLM) feedback** to improve offline reinforcement learning (RL). SFBC filters and weights sub-trajectories based on VLM-derived success probabilities, enabling effective policy learning in the **absence of explicit rewards**.
 
 ## Installation
 To set up the environment, use Conda:
@@ -24,7 +24,7 @@ If you use this code in your research, please cite our paper:
 @article{beck2025sfo,
   author    = {Jacob Beck},
   title     = {SFO: Piloting VLM Feedback for Offline RL},
-  journal   = {arXiv},
+  journal   = {RLC Workshop on Reinforcement Learning Beyond Rewards: Ingredients for Developing Generalist Agents},
   year      = {2025}
 }
 ```
