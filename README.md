@@ -1,5 +1,7 @@
 # Offline RLAIF: Piloting VLM Feedback for RL via SFO
 
+![Offline RLAIF](Title_Img.png)
+
 This repository contains code for the paper [*Offline RLAIF: Piloting VLM Feedback for RL via SFO* (Beck et al., 2025)](https://arxiv.org/abs/2503.01062), published at [The RLC Workshop on Reinforcement Learning Beyond Rewards: Ingredients for Developing Generalist Agents](https://rlbrew2-workshop.github.io). The code includes an implementation of **Sub-Trajectory Filtered Behavior Cloning (SFBC)**, a method that leverages **vision-language model (VLM) feedback** to improve offline reinforcement learning (RL). SFBC filters and weights sub-trajectories based on VLM-derived success probabilities, enabling effective policy learning in the **absence of explicit rewards**.
 
 ## Installation
