@@ -3,10 +3,11 @@ sfbc_videos/
 *.npy
 *.jsonl
 *.mp4
-*.png
+*/*.png
 __pycache__
 Feedback Backup/
 d3rlpy_data/
 Figs/
-*.pdf
+Poster Figs/
+SFO_*.pdf
 *.zip
